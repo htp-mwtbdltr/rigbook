@@ -1920,13 +1920,14 @@ function keyboardPartsCard(a, cat, reload) {
     h('div', { class: 'card-head' }, h('h2', null, cat.label, h('span', { class: 'n' }, (sw ? n : parts.length) || '')), parts.length ? addBtn('small') : null),
     parts.length ? h('div', { class: 'table-wrap' }, h('table', null,
       h('thead', null, h('tr', null, h('th', null, singular(cat.label)), sw ? h('th', null, 'Type') : cat.fields.length ? h('th', { class: 'hide-sm' }, 'Specs') : null,
-        sw ? h('th', { class: 'num' }, 'Force') : null, showQty ? h('th', { class: 'num' }, 'Qty') : null, h('th', { class: 'hide-sm' }, sw ? 'Where' : 'Notes'), h('th', null, ''))),
+        sw ? h('th', { class: 'num', title: 'Actuation / bottom-out force' }, 'Actuation / bottom-out') : null, showQty ? h('th', { class: 'num' }, 'Qty') : null, h('th', { class: 'hide-sm' }, sw ? 'Where' : 'Notes'), h('th', null, ''))),
       h('tbody', null, parts.map(c => h('tr', null,
         h('td', null, h('a', { class: 'ent', href: `#/inventory/${c.id}` }, catIcon(c.category, 'sm'),
           h('div', null, h('div', { class: 't' }, c.name), c.spare_qty ? h('div', { class: 's' }, `${c.spare_qty} more on hand`) : null))),
         sw ? h('td', null, switchTypePill(c.specs.type) || h('span', { class: 'faint' }, '—'))
           : cat.fields.length ? h('td', { class: 'hide-sm' }, specChips(c.category, c.specs, { compact: true })) : null,
-        sw ? h('td', { class: 'num small nowrap' }, c.specs.actuation ? `${c.specs.actuation} gf` : h('span', { class: 'faint' }, '—')) : null,
+        sw ? h('td', { class: 'num small nowrap' }, c.specs.actuation || c.specs.bottom_out
+          ? `${c.specs.actuation || '—'} / ${c.specs.bottom_out || '—'} gf` : h('span', { class: 'faint' }, '—')) : null,
         showQty ? h('td', { class: 'num' }, h('span', { class: 'qty' }, c.qty)) : null,
         h('td', { class: 'small hide-sm' }, (sw ? c.slot : c.install_notes) || h('span', { class: 'faint' }, '—')),
         rowActions(

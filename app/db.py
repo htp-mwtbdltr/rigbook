@@ -177,6 +177,7 @@ KEYBOARD_CATEGORIES = [
             {"key": "type", "label": "Type", "type": "select",
              "options": _sel("Linear", "Tactile", "Clicky", "Silent linear", "Silent tactile")},
             {"key": "actuation", "label": "Actuation force (gf)", "type": "number"},
+            {"key": "bottom_out", "label": "Bottom-out force (gf)", "type": "number"},
         ],
     },
     {
@@ -254,6 +255,15 @@ def init():
             have_keys = {c["key"] for c in cats}
             set_setting(conn, "categories", cats + [c for c in KEYBOARD_CATEGORIES if c["key"] not in have_keys])
             set_setting(conn, "keyboard_categories_added", True)
+        # Bottom-out force on switches, once, for databases that got the switch category before it existed
+        if get_setting(conn, "switch_bottom_out_added") is None:
+            cats = get_setting(conn, "categories")
+            for c in cats:
+                if c["key"] == "switch" and not any(f["key"] == "bottom_out" for f in c["fields"]):
+                    at = next((i + 1 for i, f in enumerate(c["fields"]) if f["key"] == "actuation"), len(c["fields"]))
+                    c["fields"].insert(at, {"key": "bottom_out", "label": "Bottom-out force (gf)", "type": "number"})
+            set_setting(conn, "categories", cats)
+            set_setting(conn, "switch_bottom_out_added", True)
 
 
 def get_setting(conn, key):
