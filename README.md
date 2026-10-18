@@ -9,7 +9,13 @@ A self-hosted homelab asset and parts inventory. **Assets** are machines and net
   - by running a script on the machine, which posts the result back (this also works from a live USB);
   - over SNMP for switches and access points.
 - **Every scan is reviewed** before it's saved, and you can edit anything first, for example correcting soldered RAM to LPDDR5. Rescans never overwrite what you recorded unless you tick the box.
-- **Categories, fields and asset types** can be edited under Settings.
+- **Keyboards** have their own section: each board has a brand, model, size (60%, 75%, TKL…), key count and
+  connection types. **Switches** are counted individually and **keycaps** are tracked by set. Putting 70 switches on a
+  board takes them out of the on-hand count, and a board can mix several switch kinds and keycap sets.
+- **Every list can be sorted** by clicking a column header. Text sorts A→Z then Z→A, and numbers and sizes sort
+  smallest first then largest first.
+- **Categories, fields and asset types** can be edited under Settings. Each category is listed under either
+  Inventory (computer parts) or Keyboards.
 
 Everything runs in one small container: FastAPI, plain JS with no build step, and SQLite.
 

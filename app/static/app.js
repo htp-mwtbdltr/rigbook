@@ -68,8 +68,9 @@ async function loadMeta() {
 
 async function refreshCounts() {
   const [assets, items] = await Promise.all([api('GET', '/api/assets'), api('GET', '/api/items')]);
-  COUNTS.assets = assets.length;
-  COUNTS.items = items.length;
+  COUNTS.assets = assets.filter(a => !isKeyboard(a)).length;
+  COUNTS.keyboards = assets.filter(isKeyboard).length;
+  COUNTS.items = items.filter(i => !isKbCat(i.category)).length;
   COUNTS.byCat = {};
   for (const it of items) COUNTS.byCat[it.category] = (COUNTS.byCat[it.category] || 0) + 1;
   renderNav();
@@ -147,6 +148,9 @@ const ICONS = {
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
   link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
   refresh: '<path d="M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5"/>',
+  keyboard: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/>',
+  kbswitch: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M12 8v8M8 12h8"/>',
+  keycap: '<path d="M3 19h18L18.6 6.4a1.5 1.5 0 0 0-1.5-1.2H6.9a1.5 1.5 0 0 0-1.5 1.2z"/><path d="M8.5 10h7"/>',
 };
 
 function icon(name, cls) {
@@ -161,6 +165,7 @@ function icon(name, cls) {
 const CAT_STYLE = {
   cpu: ['cpu', 'blue'], ram: ['ram', 'green'], storage: ['storage', 'amber'], gpu: ['gpu', 'purple'],
   motherboard: ['board', 'teal'], psu: ['psu', 'orange'], nic: ['nic', 'pink'], other: ['box', 'gray'],
+  switch: ['kbswitch', 'orange'], keycaps: ['keycap', 'purple'],
 };
 function catIcon(key, size) {
   const [ic, color] = CAT_STYLE[key] || ['box', 'gray'];
@@ -184,6 +189,21 @@ const STATUS_COLORS = { 'in use': 'green', spare: 'blue', wiped: 'amber', 'for s
 function statusPill(status) {
   if (!status) return null;
   return h('span', { class: 'pill p-' + (STATUS_COLORS[status.toLowerCase()] || 'gray') }, status);
+}
+
+const isKeyboard = a => a.kind === 'keyboard';
+const isKbCat = key => !!(CATS[key] && CATS[key].group === 'keyboard');
+const assetHref = a => `#/${isKeyboard(a) ? 'keyboards' : 'assets'}/${a.id}`;
+function assetIcon(a, size) {
+  if (!isKeyboard(a)) return typeIcon(a.asset_type, size);
+  return h('span', { class: `ico c-teal${size ? ' ' + size : ''}` }, icon('keyboard'));
+}
+/** "Switches" -> "Switch", "Keycaps" -> "Keycap" */
+const singular = label => String(label || '').replace(/(ch|sh|x)es$/i, '$1').replace(/s$/i, '');
+const SWITCH_COLORS = { linear: 'red', tactile: 'amber', clicky: 'blue' };
+function switchTypePill(type) {
+  if (!type) return null;
+  return h('span', { class: 'pill p-' + (/silent/i.test(type) ? 'gray' : SWITCH_COLORS[type.toLowerCase()] || 'gray') }, type);
 }
 
 function emptyState(ic, title, text, action) {
@@ -297,6 +317,66 @@ function specInputs(catKey, specs, onChange) {
   });
 }
 
+// ------------------------------------------------------------------ sortable tables
+
+/** Sort state per table, kept while the page is open so it survives redraws and navigation. */
+const SORTS = {};
+
+/** Total size in GB of text like "32GB LPDDR5" or "1TB NVMe SSD, 2× 4TB SATA HDD"; null when there is none. */
+function sizeGB(text) {
+  let total = 0;
+  String(text || '').replace(/(?:(\d+)\s*×\s*)?(\d+(?:\.\d+)?)\s*(TB|GB|MB)\b/gi, (_, n, v, unit) => {
+    total += (Number(n) || 1) * Number(v) * { tb: 1024, gb: 1, mb: 1 / 1024 }[unit.toLowerCase()];
+  });
+  return total || null;
+}
+
+/** A value that sorts sensibly: sizes and numbers as numbers, everything else as text. */
+function sortVal(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return v;
+  const s = String(v).trim();
+  if (/^\d+(\.\d+)?\s*(TB|GB|MB)$/i.test(s)) return sizeGB(s);
+  const m = /^-?\d+(\.\d+)?/.exec(s);
+  return m ? Number(m[0]) : s;
+}
+
+/** Layouts sort by their size: "60%" < "TKL (80%)" < "Full size (100%)", then named ones like "Split". */
+const layoutVal = v => { const m = /(\d+)%/.exec(v || ''); return m ? Number(m[1]) : (v || null); };
+
+function compareVals(a, b) {
+  const na = typeof a === 'number', nb = typeof b === 'number';
+  if (na && nb) return a - b;
+  if (na !== nb) return na ? -1 : 1;
+  return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+/** Rows in the table's chosen order (blank values always last). cols: [{ key, sort: row => value }] */
+function sortRows(id, rows, cols) {
+  const s = SORTS[id];
+  const col = s && cols.find(c => c.key === s.key && c.sort);
+  if (!col) return rows;
+  return rows.map(r => [sortVal(col.sort(r)), r]).sort(([a], [b]) => {
+    if (a == null || b == null) return (a == null) - (b == null);
+    return s.dir * compareVals(a, b);
+  }).map(([, r]) => r);
+}
+
+/** Header cells; a click sorts A→Z / smallest first, a second click reverses. cols: [{ key, label, cls, sort }] */
+function sortHeads(id, cols, redraw) {
+  return cols.map(c => {
+    if (!c.sort) return h('th', { class: c.cls || null }, c.label);
+    const s = SORTS[id], on = !!(s && s.key === c.key);
+    return h('th', { class: [c.cls, 'sortable', on ? 'sorted' : ''].filter(Boolean).join(' '), 'aria-sort': on ? (s.dir > 0 ? 'ascending' : 'descending') : null },
+      h('button', {
+        class: 'th-sort', title: 'Sort by ' + String(c.label).toLowerCase(), onclick: () => {
+          SORTS[id] = { key: c.key, dir: on ? -s.dir : 1 };
+          redraw();
+        },
+      }, c.label, h('span', { class: 'arrow', 'aria-hidden': 'true' }, on ? (s.dir > 0 ? '↑' : '↓') : '↕')));
+  });
+}
+
 // ------------------------------------------------------------------ shell: nav, crumbs, search, theme
 
 function renderNav() {
@@ -305,14 +385,19 @@ function renderNav() {
   const item = (href, key, ic, label, n, hot) => h('a', {
     class: 'nav-item' + (NAV.active === key && !(key === 'inventory' && NAV.cat) ? ' active' : ''), href,
   }, icon(ic), label, n != null ? h('span', { class: 'n' + (hot ? ' hot' : '') }, n) : null);
-  const cats = META.categories.filter(c => COUNTS.byCat[c.key]);
+  const cats = META.categories.filter(c => COUNTS.byCat[c.key] && c.group !== 'keyboard');
+  const catLink = c => h('a', {
+    class: 'nav-item' + (NAV.active === 'inventory' && NAV.cat === c.key ? ' active' : ''), href: `#/inventory?cat=${c.key}`,
+  }, c.group === 'keyboard' ? icon((CAT_STYLE[c.key] || ['box'])[0]) : null, c.label,
+    COUNTS.byCat[c.key] ? h('span', { class: 'n' }, COUNTS.byCat[c.key]) : null);
   setKids(nav,
     h('div', { class: 'nav-label' }, 'Track'),
     item('#/assets', 'assets', 'monitor', 'Assets', COUNTS.assets),
     item('#/inventory', 'inventory', 'boxes', 'Inventory', COUNTS.items),
-    cats.length ? h('div', { class: 'nav-sub' }, cats.map(c => h('a', {
-      class: 'nav-item' + (NAV.active === 'inventory' && NAV.cat === c.key ? ' active' : ''), href: `#/inventory?cat=${c.key}`,
-    }, c.label, h('span', { class: 'n' }, COUNTS.byCat[c.key])))) : null,
+    cats.length ? h('div', { class: 'nav-sub' }, cats.map(catLink)) : null,
+    h('div', { class: 'nav-label' }, 'Keyboards'),
+    item('#/keyboards', 'keyboards', 'keyboard', 'Keyboards', COUNTS.keyboards),
+    META.categories.filter(c => c.group === 'keyboard').map(catLink),
     h('div', { class: 'nav-label' }, 'Discover'),
     item('#/assets/new', 'new', 'plus', 'Add asset'),
     item('#/scans', 'scans', 'scan', 'Scans', META.pending_scans || null, true),
@@ -367,11 +452,11 @@ function setupSearch() {
     if (!q || !data) { results.hidden = true; return; }
     const words = q.split(/\s+/);
     const hit = text => words.every(w => text.includes(w));
-    const assets = data.assets.filter(a => hit(hay([a.name, a.hostname, a.address, a.model, a.manufacturer, a.serial, a.os, a.location, a.asset_type, Object.values(a.summary || {})]))).slice(0, 6);
+    const assets = data.assets.filter(a => hit(hay([a.name, a.hostname, a.address, a.model, a.manufacturer, a.serial, a.os, a.location, a.asset_type, isKeyboard(a) ? ['keyboard', Object.values(a.specs).flat()] : [], Object.values(a.summary || {})]))).slice(0, 6);
     const items = data.items.filter(i => hit(hay([i.name, i.manufacturer, i.model_number, i.location, catLabel(i.category), Object.values(i.specs || {})]))).slice(0, 8);
     links = [
-      ...assets.map(a => h('a', { href: `#/assets/${a.id}` }, typeIcon(a.asset_type, 'sm'),
-        h('div', { class: 'ent' }, h('div', null, h('div', { class: 't' }, a.name), h('div', { class: 's' }, [makerModel(a), a.hostname].filter(Boolean).join(' · ')))))),
+      ...assets.map(a => h('a', { href: assetHref(a) }, assetIcon(a, 'sm'),
+        h('div', { class: 'ent' }, h('div', null, h('div', { class: 't' }, a.name), h('div', { class: 's' }, [makerModel(a), a.hostname, isKeyboard(a) ? a.specs.layout : ''].filter(Boolean).join(' · ')))))),
       ...items.map(i => h('a', { href: `#/inventory/${i.id}` }, catIcon(i.category, 'sm'),
         h('div', { class: 'ent' }, h('div', null, h('div', { class: 't' }, i.name),
           h('div', { class: 's' }, [catLabel(i.category), i.manufacturer, `${i.installed_qty} in use · ${i.spare_qty} spare`].filter(Boolean).join(' · ')))))),
@@ -514,9 +599,10 @@ function itemFormFields(data, opts = {}) {
   let nameTouched = !!data.name;
   const nameInput = h('input', { value: data.name || '', oninput: e => { data.name = e.target.value; nameTouched = !!e.target.value; } });
   const specsBox = h('div', { class: 'grid' });
+  const kb = isKbCat(data.category);
   const autoName = () => {
     if (nameTouched) return;
-    data.name = renderName(CATS[data.category], data.specs, '');
+    data.name = renderName(CATS[data.category], { ...data.specs, manufacturer: data.manufacturer, model_number: data.model_number }, '');
     nameInput.value = data.name;
   };
   const drawSpecs = () => {
@@ -524,7 +610,7 @@ function itemFormFields(data, opts = {}) {
       if (v) data.specs[k] = v; else delete data.specs[k];
       autoName();
     });
-    setKids(specsBox, inputs.length ? inputs : h('div', { class: 'muted small' }, 'This category has no fields. Add some under Settings.'));
+    setKids(specsBox, inputs.length ? inputs : h('div', { class: 'muted small' }, kb ? 'Nothing else to fill in. Fields can be added under Settings.' : 'This category has no fields. Add some under Settings.'));
   };
   const catSelect = selectEl(META.categories.map(c => [c.key, c.label]), data.category, {
     disabled: opts.lockCategory || null,
@@ -535,14 +621,15 @@ function itemFormFields(data, opts = {}) {
   return h('div', null,
     section(opts.title || 'Part', h('div', { class: 'grid' },
       opts.lockCategory ? null : field('Category', catSelect),
-      field('Name', nameInput),
-      field('Manufacturer', h('input', { value: data.manufacturer || '', oninput: e => { data.manufacturer = e.target.value; } })),
-      field('Model / part number', h('input', { value: data.model_number || '', oninput: e => { data.model_number = e.target.value; } })),
-      tpl && !nameTouched ? h('div', { class: 'muted small wide' }, 'Leave the name blank and it fills in from the specs below.') : null)),
+      kb ? null : field('Name', nameInput),
+      field(kb ? 'Brand' : 'Manufacturer', h('input', { value: data.manufacturer || '', oninput: e => { data.manufacturer = e.target.value; autoName(); } })),
+      field(kb ? 'Model' : 'Model / part number', h('input', { value: data.model_number || '', oninput: e => { data.model_number = e.target.value; autoName(); } })),
+      kb ? field('Name', nameInput) : null,
+      tpl && !nameTouched ? h('div', { class: 'muted small wide' }, kb ? 'Leave the name blank and it fills in from the brand and model.' : 'Leave the name blank and it fills in from the specs below.') : null)),
     section('Specifications', specsBox),
     opts.hideStock ? null : section('Stock', h('div', { class: 'grid' },
-      field('Spare (not installed)', h('input', { type: 'number', min: 0, value: data.spare_qty ?? 0, oninput: e => { data.spare_qty = e.target.value; } })),
-      field('Spares stored at', h('input', { list: 'dl-locations', value: data.location || '', placeholder: 'e.g. Storage, parts bin 3', oninput: e => { data.location = e.target.value; } })),
+      field(kb ? (data.category === 'switch' ? 'On hand, not in a keyboard (individual switches)' : 'On hand, not on a keyboard') : 'Spare (not installed)', h('input', { type: 'number', min: 0, value: data.spare_qty ?? 0, oninput: e => { data.spare_qty = e.target.value; } })),
+      field(kb ? 'Stored at' : 'Spares stored at', h('input', { list: 'dl-locations', value: data.location || '', placeholder: 'e.g. Storage, parts bin 3', oninput: e => { data.location = e.target.value; } })),
       field('Notes', h('textarea', { value: data.notes || '', oninput: e => { data.notes = e.target.value; } }), 'wide'))),
     datalist('dl-locations', META.locations));
 }
@@ -574,12 +661,15 @@ function itemOptionLabel(it) {
   return `${it.name}${extra.length ? ` (${extra.join(', ')})` : ''} — ${it.spare_qty} spare`;
 }
 
-/** Add a component to an asset: pick an existing inventory item or create one. */
-async function addComponentModal(asset, onDone) {
-  const items = await api('GET', '/api/items');
-  const state = { category: META.categories[0].key, item_id: '', qty: 1, slot: '', serial: '', notes: '', take: true, newItem: null };
+/** Add a component to an asset: pick an existing inventory item or create one. Keyboards only take keyboard parts. */
+async function addComponentModal(asset, onDone, category) {
+  const kb = isKeyboard(asset);
+  const cats = META.categories.filter(c => isKbCat(c.key) === kb);
+  const items = (await api('GET', '/api/items')).filter(i => isKbCat(i.category) === kb);
+  const state = { category: category || cats[0].key, item_id: '', qty: 1, slot: '', serial: '', notes: '', take: true, newItem: null };
   const box = h('div');
   const draw = () => {
+    const isSwitch = state.category === 'switch';
     const inCat = items.filter(i => i.category === state.category);
     const itemSel = selectEl([['', '+ New item…'], ...inCat.map(i => [String(i.id), itemOptionLabel(i)])], state.item_id, {
       onchange: e => {
@@ -589,36 +679,44 @@ async function addComponentModal(asset, onDone) {
         draw();
       },
     });
-    if (!state.item_id && !state.newItem) state.newItem = { category: state.category, specs: {} };
+    if (!state.item_id && !state.newItem) state.newItem = { category: state.category, specs: {}, spare_qty: 0 };
     const chosen = items.find(i => String(i.id) === state.item_id);
     setKids(box,
       section('Part', h('div', { class: 'grid' },
-        field('Category', selectEl(META.categories.map(c => [c.key, c.label]), state.category, {
+        category ? null : field('Category', selectEl(cats.map(c => [c.key, c.label]), state.category, {
           onchange: e => { state.category = e.target.value; state.item_id = ''; state.newItem = null; draw(); },
         })),
-        field('Inventory item', itemSel),
+        field(kb ? catLabel(state.category) : 'Inventory item', itemSel),
         chosen ? h('div', { class: 'wide' }, specChips(chosen.category, chosen.specs)) : null,
         chosen ? h('label', { class: 'check wide' },
           h('input', { type: 'checkbox', checked: state.take, onchange: e => { state.take = e.target.checked; } }),
-          `Take from spare stock (${chosen.spare_qty} available)`) : null)),
-      !state.item_id ? h('div', { class: 'form-section' }, itemFormFields(state.newItem, { lockCategory: true, hideStock: true, title: 'New item' })) : null,
-      section('Install', h('div', { class: 'grid' },
-        field('Quantity', h('input', { type: 'number', min: 1, value: state.qty, oninput: e => { state.qty = e.target.value; } })),
-        field('Slot', h('input', { value: state.slot, placeholder: 'e.g. DIMM A1, M.2 #2', oninput: e => { state.slot = e.target.value; } })),
-        field('Serial', h('input', { value: state.serial, oninput: e => { state.serial = e.target.value; } })),
-        field('Notes', h('input', { value: state.notes, oninput: e => { state.notes = e.target.value; } })))),
+          kb ? `Take from stock (${chosen.spare_qty} on hand)` : `Take from spare stock (${chosen.spare_qty} available)`) : null)),
+      !state.item_id ? h('div', { class: 'form-section' }, itemFormFields(state.newItem, { lockCategory: true, hideStock: !kb, title: kb ? `New ${catLabel(state.category).toLowerCase()}` : 'New item' })) : null,
+      kb ? section(isSwitch ? 'In this keyboard' : null, h('div', { class: 'grid' },
+        isSwitch ? field('How many', h('input', { type: 'number', min: 1, value: state.qty, oninput: e => { state.qty = e.target.value; } })) : null,
+        field(isSwitch ? 'Where (optional)' : 'Notes', h('input', {
+          value: isSwitch ? state.slot : state.notes, placeholder: isSwitch ? 'e.g. alphas, mods, spacebar' : '',
+          oninput: e => { if (isSwitch) state.slot = e.target.value; else state.notes = e.target.value; },
+        }))))
+        : section('Install', h('div', { class: 'grid' },
+          field('Quantity', h('input', { type: 'number', min: 1, value: state.qty, oninput: e => { state.qty = e.target.value; } })),
+          field('Slot', h('input', { value: state.slot, placeholder: 'e.g. DIMM A1, M.2 #2', oninput: e => { state.slot = e.target.value; } })),
+          field('Serial', h('input', { value: state.serial, oninput: e => { state.serial = e.target.value; } })),
+          field('Notes', h('input', { value: state.notes, oninput: e => { state.notes = e.target.value; } })))),
     );
   };
   draw();
-  openModal(`Add component to ${asset.name}`, box, [
+  const what = kb ? catLabel(state.category).toLowerCase() : 'component';
+  openModal(`Add ${what} to ${asset.name}`, box, [
     { label: 'Cancel' },
     {
-      label: 'Add component', class: 'primary', action: async () => {
+      label: `Add ${what}`, class: 'primary', action: async () => {
         const body = { qty: Number(state.qty) || 1, slot: state.slot, serial: state.serial, notes: state.notes };
         if (state.item_id) { body.item_id = Number(state.item_id); body.take_from_spare = state.take; }
         else body.new_item = { ...state.newItem, category: state.category };
+        if (kb && state.category !== 'switch') body.qty = 1;
         await api('POST', `/api/assets/${asset.id}/components`, body);
-        toast('Component added');
+        toast(kb ? 'Added' : 'Component added');
         onDone();
       },
     },
@@ -696,9 +794,19 @@ const ASSET_FILTERS = { q: '', status: '', type: '', location: '' };
 
 async function assetsView() {
   setCrumbs(['Assets']);
-  const assets = await api('GET', '/api/assets');
+  const assets = (await api('GET', '/api/assets')).filter(a => !isKeyboard(a));
   const hasGpu = assets.some(a => a.summary.gpu);
   const body = h('tbody');
+  const headRow = h('tr');
+  const cols = [
+    { key: 'name', label: 'Asset', sort: a => a.name },
+    { key: 'status', label: 'Status', sort: a => a.status },
+    { key: 'cpu', label: 'CPU', sort: a => a.summary.cpu },
+    { key: 'ram', label: 'Memory', sort: a => sizeGB(a.summary.ram) },
+    { key: 'storage', label: 'Storage', sort: a => sizeGB(a.summary.storage) },
+    hasGpu ? { key: 'gpu', label: 'GPU', sort: a => a.summary.gpu } : null,
+    { key: 'location', label: 'Location', cls: 'hide-sm', sort: a => a.location },
+  ].filter(Boolean);
   const tabs = h('div', { class: 'tabs' });
   const count = h('span', { class: 'count' });
   const statuses = [...new Set([...META.statuses, ...assets.map(a => a.status).filter(Boolean)])];
@@ -714,11 +822,12 @@ async function assetsView() {
   const cell = v => h('td', { class: 'small' }, v || h('span', { class: 'faint' }, '—'));
   const draw = () => {
     const q = ASSET_FILTERS.q.toLowerCase();
-    const rows = assets.filter(a =>
+    const rows = sortRows('assets', assets.filter(a =>
       (!ASSET_FILTERS.status || a.status === ASSET_FILTERS.status) &&
       (!ASSET_FILTERS.type || a.asset_type === ASSET_FILTERS.type) &&
       (!ASSET_FILTERS.location || a.location === ASSET_FILTERS.location) &&
-      (!q || JSON.stringify(a).toLowerCase().includes(q)));
+      (!q || JSON.stringify(a).toLowerCase().includes(q))), cols);
+    setKids(headRow, sortHeads('assets', cols, draw));
     count.textContent = `${rows.length} of ${assets.length}`;
     setKids(body, ...rows.map(a => h('tr', { class: 'clickable', onclick: () => { location.hash = `#/assets/${a.id}`; } },
       h('td', null, h('a', { class: 'ent', href: `#/assets/${a.id}`, onclick: e => e.stopPropagation() }, typeIcon(a.asset_type),
@@ -751,8 +860,7 @@ async function assetsView() {
         filterSel('location', locations, 'All locations'),
         h('span', { class: 'grow' }), count),
       h('div', { class: 'table-wrap' }, h('table', null,
-        h('thead', null, h('tr', null, h('th', null, 'Asset'), h('th', null, 'Status'), h('th', null, 'CPU'), h('th', null, 'Memory'),
-          h('th', null, 'Storage'), hasGpu ? h('th', null, 'GPU') : null, h('th', { class: 'hide-sm' }, 'Location'))),
+        h('thead', null, headRow),
         body))),
   ];
 }
@@ -761,6 +869,7 @@ async function assetsView() {
 
 async function assetView(id) {
   const a = await api('GET', `/api/assets/${id}`);
+  if (isKeyboard(a)) return keyboardPage(a);
   setCrumbs(['Assets', '#/assets'], [a.name]);
   const reload = () => route();
   const groups = {};
@@ -1377,7 +1486,7 @@ async function reviewView(scanId, assetIdParam) {
   const discard = async () => { await api('DELETE', `/api/scans/${scanId}`); await loadMeta(); location.hash = '#/scans'; };
 
   const draw = () => {
-    const target = selectEl([['', 'Create a new asset'], ...assets.map(a => [String(a.id), `Update ${a.name}`])], rv.assetId ? String(rv.assetId) : '', {
+    const target = selectEl([['', 'Create a new asset'], ...assets.filter(a => !isKeyboard(a)).map(a => [String(a.id), `Update ${a.name}`])], rv.assetId ? String(rv.assetId) : '', {
       style: 'width:auto',
       onchange: async e => {
         rv.assetId = e.target.value ? Number(e.target.value) : null;
@@ -1419,8 +1528,12 @@ async function reviewView(scanId, assetIdParam) {
 const INV_FILTERS = { q: '', stock: '', location: '' };
 
 async function inventoryView(catParam) {
-  const items = await api('GET', '/api/items');
+  // Keyboard parts (switches, keycaps) are their own group, listed under Keyboards instead of Inventory
+  const group = (CATS[catParam] && CATS[catParam].group) || '';
+  const kb = group === 'keyboard';
+  const items = (await api('GET', '/api/items')).filter(i => ((CATS[i.category] || {}).group || '') === group);
   const state = { cat: CATS[catParam] ? catParam : '' };
+  const groupCats = META.categories.filter(c => (c.group || '') === group);
   const counts = {};
   for (const it of items) counts[it.category] = (counts[it.category] || 0) + 1;
   const tabs = h('div', { class: 'tabs' });
@@ -1438,29 +1551,42 @@ async function inventoryView(catParam) {
   };
   const drawHead = () => {
     const label = state.cat ? catLabel(state.cat) : 'Inventory';
-    setCrumbs(...(state.cat ? [['Inventory', '#/inventory'], [label]] : [['Inventory']]));
+    setCrumbs(...(state.cat ? [kb ? ['Keyboards', '#/keyboards'] : ['Inventory', '#/inventory'], [label]] : [['Inventory']]));
     renderCrumbs();
+    const sub = kb ? (state.cat === 'switch' ? 'Every switch you own, in a keyboard or in the bag' : `Every ${label.toLowerCase()} set, on a keyboard or on the shelf`)
+      : state.cat ? `${counts[state.cat] || 0} ${label} parts, installed or on the shelf` : 'Every part, installed or on the shelf';
     setKids(head,
       h('div', { class: 'ent' }, state.cat ? catIcon(state.cat, 'lg') : null,
-        h('div', null, h('h1', null, label), h('div', { class: 'sub' }, state.cat ? `${counts[state.cat] || 0} ${label} parts, installed or on the shelf` : 'Every part, installed or on the shelf'))),
-      h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: () => editItemModal({ category: state.cat || META.categories[0].key, specs: {}, spare_qty: 1 }, id => { location.hash = `#/inventory/${id}`; }) }, icon('plus'), 'New item')));
+        h('div', null, h('h1', null, label), h('div', { class: 'sub' }, sub))),
+      h('div', { class: 'actions' }, h('button', { class: 'primary', onclick: () => editItemModal({ category: state.cat || groupCats[0].key, specs: {}, spare_qty: 1 }, id => { location.hash = `#/inventory/${id}`; }) }, icon('plus'),
+        kb ? `New ${singular(label).toLowerCase()}${state.cat === 'keycaps' ? ' set' : ''}` : 'New item')));
   };
   const drawTabs = () => {
     setKids(tabs,
-      h('button', { class: state.cat ? '' : 'active', onclick: () => setCat('') }, 'All ', h('span', { class: 'n' }, items.length)),
-      ...META.categories.filter(c => counts[c.key]).map(c => h('button', {
+      kb ? null : h('button', { class: state.cat ? '' : 'active', onclick: () => setCat('') }, 'All ', h('span', { class: 'n' }, items.length)),
+      ...groupCats.filter(c => counts[c.key] || c.key === state.cat).map(c => h('button', {
         class: state.cat === c.key ? 'active' : '', onclick: () => setCat(c.key),
-      }, c.label, ' ', h('span', { class: 'n' }, counts[c.key]))));
+      }, c.label, ' ', h('span', { class: 'n' }, counts[c.key] || 0))));
   };
   const qtyCell = (n, cls) => h('td', { class: 'num' }, h('span', { class: 'qty' + (n ? '' : ' zero') + (cls ? ' ' + cls : '') }, n));
-  const spareCell = n => h('td', { class: 'num' }, n ? h('span', { class: 'pill p-green' }, `${n} spare`) : h('span', { class: 'qty zero' }, '0'));
+  const spareCell = n => h('td', { class: 'num' }, n ? h('span', { class: 'pill p-green' }, kb ? `${n}` : `${n} spare`) : h('span', { class: 'qty zero' }, '0'));
+  const where = n => kb ? `${n} keyboard${n > 1 ? 's' : ''}` : `${n} machine${n > 1 ? 's' : ''}`;
   const partCell = it => h('td', null, h('a', { class: 'ent', href: `#/inventory/${it.id}`, onclick: e => e.stopPropagation() }, catIcon(it.category),
-    h('div', null, h('div', { class: 't' }, it.name), h('div', { class: 's' }, [it.manufacturer, it.model_number].filter(Boolean).join(' · ') || catLabel(it.category)))));
+    h('div', null, h('div', { class: 't' }, it.name), h('div', { class: 's' }, kb && norm(it.name) === norm(`${it.manufacturer}${it.model_number}`) ? ''
+      : [it.manufacturer, it.model_number].filter(Boolean).join(' · ') || catLabel(it.category)))));
   const usedCell = it => h('td', { class: 'num', title: it.asset_count ? `in ${it.asset_count} asset${it.asset_count > 1 ? 's' : ''}` : '' },
     h('span', { class: 'qty' + (it.installed_qty ? '' : ' zero') }, it.installed_qty),
-    it.asset_count ? h('div', { class: 'faint small' }, `${it.asset_count} machine${it.asset_count > 1 ? 's' : ''}`) : null);
+    it.asset_count ? h('div', { class: 'faint small' }, where(it.asset_count)) : null);
   const locCell = it => h('td', { class: 'small nowrap hide-sm' }, it.spare_qty && it.location ? it.location : h('span', { class: 'faint' }, '—'));
 
+  const headRow = h('tr');
+  const baseCols = {
+    part: { key: 'part', label: 'Part', sort: it => it.name },
+    used: { key: 'used', label: kb ? 'In keyboards' : 'In use', cls: 'num', sort: it => it.installed_qty },
+    spare: { key: 'spare', label: kb ? 'On hand' : 'Spare', cls: 'num', sort: it => it.spare_qty },
+    total: { key: 'total', label: 'Total', cls: 'num', sort: it => it.installed_qty + it.spare_qty },
+    loc: { key: 'loc', label: 'Stored at', cls: 'hide-sm', sort: it => (it.spare_qty ? it.location : '') },
+  };
   const draw = () => {
     const q = INV_FILTERS.q.toLowerCase();
     const rows = items.filter(it =>
@@ -1472,7 +1598,8 @@ async function inventoryView(catParam) {
       (!q || JSON.stringify([it.name, it.manufacturer, it.model_number, it.specs, it.location, it.notes]).toLowerCase().includes(q)));
     count.textContent = `${rows.length} item${rows.length === 1 ? '' : 's'}`;
     const spare = rows.reduce((s, r) => s + r.spare_qty, 0), used = rows.reduce((s, r) => s + r.installed_qty, 0);
-    setKids(totals, h('span', null, `${used + spare} parts in total`), h('span', null, `${used} installed · ${spare} spare`));
+    if (kb) setKids(totals, h('span', null, `${used + spare} ${state.cat === 'switch' ? 'switches' : 'sets'} in total`), h('span', null, `${used} in keyboards · ${spare} on hand`));
+    else setKids(totals, h('span', null, `${used + spare} parts in total`), h('span', null, `${used} installed · ${spare} spare`));
     if (!rows.length) {
       setKids(tableBox, items.length ? emptyState('search', 'No matches', 'Try a different search or filter.')
         : emptyState('boxes', 'No inventory yet', 'Parts are added when you scan machines, or add them by hand.'));
@@ -1481,24 +1608,34 @@ async function inventoryView(catParam) {
     const tr = it => h('tr', { class: 'clickable', onclick: () => { location.hash = `#/inventory/${it.id}`; } });
     if (state.cat) {
       const cat = CATS[state.cat] || { fields: [] };
+      baseCols.part.label = kb ? singular(cat.label) : 'Part';
+      const cols = [baseCols.part, ...cat.fields.map(f => ({ key: 'f:' + f.key, label: splitLabel(f.label)[0], sort: it => it.specs[f.key] })),
+        baseCols.used, baseCols.spare, baseCols.total, baseCols.loc];
+      const id = 'inv:' + state.cat;
+      setKids(headRow, sortHeads(id, cols, draw));
+      const specCell = (f, v) => {
+        if (!v) return h('span', { class: 'faint' }, '—');
+        return state.cat === 'switch' && f.key === 'type' ? switchTypePill(v) : specValue(f, v);
+      };
       setKids(tableBox, h('table', null,
-        h('thead', null, h('tr', null, h('th', null, 'Part'), cat.fields.map(f => h('th', null, splitLabel(f.label)[0])),
-          h('th', { class: 'num' }, 'In use'), h('th', { class: 'num' }, 'Spare'), h('th', { class: 'num' }, 'Total'), h('th', { class: 'hide-sm' }, 'Stored at'))),
-        h('tbody', null, rows.map(it => {
+        h('thead', null, headRow),
+        h('tbody', null, sortRows(id, rows, cols).map(it => {
           const row = tr(it);
           setKids(row, partCell(it),
-            cat.fields.map(f => h('td', { class: 'small nowrap' }, it.specs[f.key] ? specValue(f, it.specs[f.key]) : h('span', { class: 'faint' }, '—'))),
+            cat.fields.map(f => h('td', { class: 'small nowrap' }, specCell(f, it.specs[f.key]))),
             usedCell(it), spareCell(it.spare_qty), qtyCell(it.installed_qty + it.spare_qty), locCell(it));
           return row;
         }))));
       return;
     }
     const cats = [...new Set(rows.map(r => r.category))].sort((x, y) => catOrder(x) - catOrder(y));
+    baseCols.part.label = 'Part';
+    const cols = [baseCols.part, { key: 'specs', label: 'Specs', cls: 'hide-sm' }, baseCols.used, baseCols.spare, baseCols.total, baseCols.loc];
+    setKids(headRow, sortHeads('inv', cols, draw));
     setKids(tableBox, h('table', null,
-      h('thead', null, h('tr', null, h('th', null, 'Part'), h('th', { class: 'hide-sm' }, 'Specs'),
-        h('th', { class: 'num' }, 'In use'), h('th', { class: 'num' }, 'Spare'), h('th', { class: 'num' }, 'Total'), h('th', { class: 'hide-sm' }, 'Stored at'))),
+      h('thead', null, headRow),
       h('tbody', null, cats.map(key => {
-        const list = rows.filter(r => r.category === key);
+        const list = sortRows('inv', rows.filter(r => r.category === key), cols);
         return [
           h('tr', { class: 'group' }, h('td', { colspan: 6 }, h('div', { class: 'ent' },
             h('h3', null, h('a', { href: `#/inventory?cat=${key}`, style: 'color:inherit', onclick: e => { e.preventDefault(); setCat(key); } }, catLabel(key))),
@@ -1533,26 +1670,31 @@ async function inventoryView(catParam) {
 
 async function itemView(id) {
   const it = await api('GET', `/api/items/${id}`);
-  setCrumbs(['Inventory', '#/inventory'], [catLabel(it.category), `#/inventory?cat=${it.category}`], [it.name]);
+  const kb = isKbCat(it.category);
+  setCrumbs(kb ? ['Keyboards', '#/keyboards'] : ['Inventory', '#/inventory'], [catLabel(it.category), `#/inventory?cat=${it.category}`], [it.name]);
+  NAV.cat = it.category;
+  renderNav();
+  const machines = n => kb ? `${n} keyboard${n > 1 ? 's' : ''}` : `${n} machine${n > 1 ? 's' : ''}`;
   const reload = () => route();
   const setSpare = async n => {
     await api('PUT', `/api/items/${id}`, { spare_qty: Math.max(0, n) });
     reload();
   };
   const installModal = async () => {
-    const assets = await api('GET', '/api/assets');
-    if (!assets.length) return toast('Create an asset first', true);
+    const assets = (await api('GET', '/api/assets')).filter(a => isKeyboard(a) === kb);
+    if (!assets.length) return toast(kb ? 'Add a keyboard first' : 'Create an asset first', true);
     const state = { asset_id: String(assets[0].id), qty: 1, slot: '', serial: '', take: it.spare_qty > 0 };
-    openModal(`Install ${it.name}`, h('div', null,
-      section('Into', field('Asset', selectEl(assets.map(a => [String(a.id), a.name]), state.asset_id, { onchange: e => { state.asset_id = e.target.value; } }))),
-      section('Install', h('div', { class: 'grid' },
-        field('Quantity', h('input', { type: 'number', min: 1, value: 1, oninput: e => { state.qty = e.target.value; } })),
-        field('Slot', h('input', { oninput: e => { state.slot = e.target.value; } })),
-        field('Serial', h('input', { oninput: e => { state.serial = e.target.value; } })),
+    const sw = it.category === 'switch';
+    openModal(kb ? `Put ${it.name} on a keyboard` : `Install ${it.name}`, h('div', null,
+      section('Into', field(kb ? 'Keyboard' : 'Asset', selectEl(assets.map(a => [String(a.id), a.name]), state.asset_id, { onchange: e => { state.asset_id = e.target.value; } }))),
+      section(kb ? null : 'Install', h('div', { class: 'grid' },
+        !kb || sw ? field(sw ? 'How many' : 'Quantity', h('input', { type: 'number', min: 1, value: 1, oninput: e => { state.qty = e.target.value; } })) : null,
+        !kb || sw ? field(sw ? 'Where (optional)' : 'Slot', h('input', { placeholder: sw ? 'e.g. alphas, mods' : '', oninput: e => { state.slot = e.target.value; } })) : null,
+        kb ? null : field('Serial', h('input', { oninput: e => { state.serial = e.target.value; } })),
         h('label', { class: 'check wide' }, h('input', { type: 'checkbox', checked: state.take, onchange: e => { state.take = e.target.checked; } }),
-          `Take from spare stock (${it.spare_qty} available)`)))), [
+          kb ? `Take from stock (${it.spare_qty} on hand)` : `Take from spare stock (${it.spare_qty} available)`)))), [
       { label: 'Cancel' },
-      { label: 'Install', class: 'primary', action: async () => {
+      { label: kb ? 'Add to keyboard' : 'Install', class: 'primary', action: async () => {
         await api('POST', `/api/assets/${state.asset_id}/components`, { item_id: it.id, qty: Number(state.qty) || 1, slot: state.slot, serial: state.serial, take_from_spare: state.take });
         toast('Installed');
         reload();
@@ -1592,45 +1734,46 @@ async function itemView(id) {
       catIcon(it.category, 'lg'),
       h('div', { class: 'body' },
         h('div', { class: 'title-row' }, h('h1', null, it.name), h('span', { class: 'pill plain' }, catLabel(it.category)),
-          it.spare_qty ? h('span', { class: 'pill p-green' }, `${it.spare_qty} spare`) : null),
+          it.category === 'switch' ? switchTypePill(it.specs.type) : null,
+          it.spare_qty ? h('span', { class: 'pill p-green' }, `${it.spare_qty} ${kb ? 'on hand' : 'spare'}`) : null),
         h('div', { class: 'meta' },
           it.manufacturer ? h('span', null, icon('tag'), it.manufacturer) : null,
           it.model_number ? h('span', null, h('code', null, it.model_number)) : null,
           it.spare_qty && it.location ? h('span', null, icon('pin'), `Spares at ${it.location}`) : null,
-          h('span', null, icon('monitor'), it.asset_count ? `In ${it.asset_count} machine${it.asset_count > 1 ? 's' : ''}` : 'Not installed'))),
+          h('span', null, icon(kb ? 'keyboard' : 'monitor'), it.asset_count ? `In ${machines(it.asset_count)}` : kb ? 'Not on a keyboard' : 'Not installed'))),
       h('div', { class: 'actions' },
         h('button', { onclick: () => editItemModal(it, reload) }, icon('edit'), 'Edit'),
         h('button', { onclick: mergeModal }, icon('merge'), 'Merge'),
-        h('button', { class: 'primary', onclick: installModal }, icon('install'), 'Install into asset'),
+        h('button', { class: 'primary', onclick: installModal }, icon(kb ? 'keyboard' : 'install'), kb ? 'Add to keyboard' : 'Install into asset'),
         iconButton('trash', 'Delete item', del, 'danger'))),
     h('div', { class: 'record-grid' },
       h('div', null,
         h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, h('h2', null, 'Installed in', h('span', { class: 'n' }, it.installs.length || ''))),
+          h('div', { class: 'card-head' }, h('h2', null, kb ? 'On keyboards' : 'Installed in', h('span', { class: 'n' }, it.installs.length || ''))),
           it.installs.length ? h('div', { class: 'table-wrap' }, h('table', null,
-            h('thead', null, h('tr', null, h('th', null, 'Asset'), h('th', null, 'Status'), h('th', { class: 'num' }, 'Qty'), h('th', null, 'Slot'), h('th', null, 'Serial'), h('th', null, ''))),
-            h('tbody', null, it.installs.map(i => h('tr', { class: 'clickable', onclick: () => { location.hash = `#/assets/${i.asset_id}`; } },
-              h('td', null, h('a', { class: 'ent', href: `#/assets/${i.asset_id}`, onclick: e => e.stopPropagation() }, typeIcon(i.asset_type, 'sm'),
+            h('thead', null, h('tr', null, h('th', null, kb ? 'Keyboard' : 'Asset'), h('th', null, 'Status'), h('th', { class: 'num' }, 'Qty'), h('th', null, kb ? 'Where' : 'Slot'), kb ? null : h('th', null, 'Serial'), h('th', null, ''))),
+            h('tbody', null, it.installs.map(i => h('tr', { class: 'clickable', onclick: () => { location.hash = assetHref({ id: i.asset_id, kind: i.asset_kind }); } },
+              h('td', null, h('a', { class: 'ent', href: assetHref({ id: i.asset_id, kind: i.asset_kind }), onclick: e => e.stopPropagation() }, assetIcon({ asset_type: i.asset_type, kind: i.asset_kind }, 'sm'),
                 h('div', null, h('div', { class: 't' }, i.asset_name), h('div', { class: 's' }, [i.asset_location, i.notes].filter(Boolean).join(' · '))))),
               h('td', null, statusPill(i.asset_status)),
               h('td', { class: 'num' }, h('span', { class: 'qty' }, i.qty)),
               h('td', { class: 'small nowrap' }, i.slot || h('span', { class: 'faint' }, '—')),
-              h('td', { class: 'small' }, i.serial ? h('code', null, i.serial) : h('span', { class: 'faint' }, '—')),
-              rowActions(iconButton('trash', 'Remove from this asset', () => removeInstall(i.install_id, `${it.name} from ${i.asset_name}`, reload), 'danger')),
-            ))))) : emptyState('monitor', 'Not installed anywhere', it.spare_qty ? `All ${it.spare_qty} are on the shelf.` : null,
-            h('button', { onclick: installModal }, icon('install'), 'Install into asset'))),
+              kb ? null : h('td', { class: 'small' }, i.serial ? h('code', null, i.serial) : h('span', { class: 'faint' }, '—')),
+              rowActions(iconButton('trash', kb ? 'Take off this keyboard' : 'Remove from this asset', () => removeInstall(i.install_id, `${it.name} from ${i.asset_name}`, reload), 'danger')),
+            ))))) : emptyState(kb ? 'keyboard' : 'monitor', kb ? 'Not on a keyboard' : 'Not installed anywhere', it.spare_qty ? `All ${it.spare_qty} are on the shelf.` : null,
+            h('button', { onclick: installModal }, icon(kb ? 'keyboard' : 'install'), kb ? 'Add to keyboard' : 'Install into asset'))),
         it.notes ? h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Notes')), h('div', { class: 'card-body' }, h('p', { class: 'notes' }, it.notes))) : null),
       h('div', null,
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, h('h2', null, 'Stock')),
           h('div', { class: 'stock' },
-            h('div', null, h('div', { class: 'k' }, 'In use'), h('div', { class: 'v' }, it.installed_qty)),
-            h('div', null, h('div', { class: 'k' }, 'Spare'), h('div', { class: 'v' }, it.spare_qty)),
+            h('div', null, h('div', { class: 'k' }, kb ? 'In keyboards' : 'In use'), h('div', { class: 'v' }, it.installed_qty)),
+            h('div', null, h('div', { class: 'k' }, kb ? 'On hand' : 'Spare'), h('div', { class: 'v' }, it.spare_qty)),
             h('div', null, h('div', { class: 'k' }, 'Total'), h('div', { class: 'v' }, total))),
           total ? h('div', { class: 'stock-bar', title: `${it.installed_qty} in use, ${it.spare_qty} spare` },
             h('span', { style: `width:${(it.installed_qty / total) * 100}%` }), h('span', { style: `width:${(it.spare_qty / total) * 100}%` })) : null,
           h('div', { class: 'stock-adjust' },
-            h('span', { class: 'muted small' }, 'Spares on the shelf'),
+            h('span', { class: 'muted small' }, kb ? 'On hand, not in a keyboard' : 'Spares on the shelf'),
             h('div', { class: 'stepper' },
               h('button', { onclick: () => setSpare(it.spare_qty - 1), 'aria-label': 'One fewer spare', disabled: !it.spare_qty || null }, '−'),
               h('span', null, it.spare_qty),
@@ -1640,8 +1783,201 @@ async function itemView(id) {
           specRows.length ? propsList(specRows) : h('div', { class: 'card-body muted' }, 'No fields for this category.')),
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, h('h2', null, 'Details')),
-          propsList([['Category', catLabel(it.category)], ['Manufacturer', it.manufacturer], ['Part number', it.model_number && h('code', null, it.model_number)], ['Spares stored at', it.location]])),
+          propsList(kb ? [['Category', catLabel(it.category)], ['Brand', it.manufacturer], ['Model', it.model_number], ['Stored at', it.location]]
+            : [['Category', catLabel(it.category)], ['Manufacturer', it.manufacturer], ['Part number', it.model_number && h('code', null, it.model_number)], ['Spares stored at', it.location]])),
         activityCard(it.events))),
+  ];
+}
+
+// ------------------------------------------------------------------ keyboards
+
+const KB_FILTERS = { q: '', status: '', layout: '' };
+const connText = a => (a.specs.connections || []).join(', ');
+
+function editKeyboardModal(kbd, onSaved) {
+  const data = { status: META.statuses[0] || '', ...kbd, specs: { ...(kbd.specs || {}) } };
+  data.specs.connections = [...(data.specs.connections || [])];
+  const inp = (key, props) => h('input', { value: data[key] || '', oninput: e => { data[key] = e.target.value; }, ...props });
+  const body = h('div', null,
+    section('Keyboard', h('div', { class: 'grid' },
+      field('Brand', inp('manufacturer', { placeholder: 'e.g. Keychron' })),
+      field('Model', inp('model', { placeholder: 'e.g. Q1 Pro' })),
+      field('Name', inp('name', { placeholder: 'Defaults to brand and model' })),
+      field('Status', selectEl([['', '—'], ...META.statuses], data.status || '', { onchange: e => { data.status = e.target.value; } })))),
+    section('Layout', h('div', { class: 'grid' },
+      field('Size', selectEl([['', '—'], ...META.keyboard_layouts], data.specs.layout || '', { onchange: e => { data.specs.layout = e.target.value; } })),
+      field('Total keys', h('input', { type: 'number', min: 1, value: data.specs.keys || '', oninput: e => { data.specs.keys = e.target.value; } })),
+      h('div', { class: 'field wide' }, h('span', null, 'Connection'),
+        h('div', { class: 'checks' }, META.keyboard_connections.map(c => h('label', { class: 'check' },
+          h('input', { type: 'checkbox', checked: data.specs.connections.includes(c), onchange: e => {
+            const on = new Set(data.specs.connections);
+            if (e.target.checked) on.add(c); else on.delete(c);
+            data.specs.connections = META.keyboard_connections.filter(x => on.has(x));
+          } }), c)))))),
+    section('Where', h('div', { class: 'grid' }, field('Location', inp('location', { list: 'dl-locations', placeholder: 'e.g. Desk, closet' })))),
+    section('Notes', h('textarea', { value: data.notes || '', 'aria-label': 'Notes', oninput: e => { data.notes = e.target.value; } })),
+    datalist('dl-locations', META.locations));
+  openModal(kbd.id ? `Edit ${kbd.name}` : 'New keyboard', body, [
+    { label: 'Cancel' },
+    {
+      label: kbd.id ? 'Save changes' : 'Add keyboard', class: 'primary', action: async () => {
+        const name = (data.name || '').trim() || makerModel(data);
+        if (!name) throw new Error('Give it a name, or a brand and model');
+        const payload = { kind: 'keyboard', name, manufacturer: data.manufacturer || '', model: data.model || '', status: data.status || '',
+          location: data.location || '', notes: data.notes || '', specs: data.specs };
+        const res = kbd.id ? await api('PUT', `/api/assets/${kbd.id}`, payload) : await api('POST', '/api/assets', payload);
+        toast('Saved');
+        onSaved(res.id);
+      },
+    },
+  ]);
+}
+
+async function keyboardsView() {
+  setCrumbs(['Keyboards']);
+  const kbs = (await api('GET', '/api/assets')).filter(isKeyboard);
+  const body = h('tbody');
+  const headRow = h('tr');
+  const count = h('span', { class: 'count' });
+  const cols = [
+    { key: 'name', label: 'Keyboard', sort: a => a.name },
+    { key: 'layout', label: 'Layout', sort: a => layoutVal(a.specs.layout) },
+    { key: 'keys', label: 'Keys', cls: 'num', sort: a => a.specs.keys },
+    { key: 'conn', label: 'Connection', cls: 'hide-sm', sort: connText },
+    { key: 'switches', label: 'Switches', cls: 'hide-sm', sort: a => a.summary.switch },
+    { key: 'keycaps', label: 'Keycaps', cls: 'hide-sm', sort: a => a.summary.keycaps },
+    { key: 'status', label: 'Status', sort: a => a.status },
+  ];
+  const faint = () => h('span', { class: 'faint' }, '—');
+  const add = () => editKeyboardModal({}, id => { location.hash = `#/keyboards/${id}`; });
+  const draw = () => {
+    const q = KB_FILTERS.q.toLowerCase();
+    const rows = sortRows('keyboards', kbs.filter(a =>
+      (!KB_FILTERS.status || a.status === KB_FILTERS.status) &&
+      (!KB_FILTERS.layout || a.specs.layout === KB_FILTERS.layout) &&
+      (!q || JSON.stringify(a).toLowerCase().includes(q))), cols);
+    count.textContent = `${rows.length} of ${kbs.length}`;
+    setKids(headRow, sortHeads('keyboards', cols, draw));
+    setKids(body, rows.map(a => {
+      const keys = Number(a.specs.keys) || 0, nSw = a.counts.switch || 0;
+      return h('tr', { class: 'clickable', onclick: () => { location.hash = `#/keyboards/${a.id}`; } },
+        h('td', null, h('a', { class: 'ent', href: `#/keyboards/${a.id}`, onclick: e => e.stopPropagation() }, assetIcon(a),
+          h('div', null, h('div', { class: 't' }, a.name), h('div', { class: 's' }, a.name !== makerModel(a) ? makerModel(a) : (a.location || '')),
+            a.summary.switch ? h('div', { class: 's show-sm' }, a.summary.switch) : null))),
+        h('td', { class: 'small nowrap' }, a.specs.layout || faint()),
+        h('td', { class: 'num' }, keys ? h('span', { class: 'qty' }, keys) : faint()),
+        h('td', { class: 'hide-sm' }, (a.specs.connections || []).length ? h('span', { class: 'chips' }, a.specs.connections.map(c => h('span', { class: 'chip' }, c))) : faint()),
+        h('td', { class: 'small hide-sm', style: 'max-width:280px' }, a.summary.switch || faint(),
+          keys && nSw && nSw !== keys ? h('div', { class: 'faint small' }, `${nSw} of ${keys} keys`) : null),
+        h('td', { class: 'small hide-sm', style: 'max-width:220px' }, a.summary.keycaps || faint()),
+        h('td', null, statusPill(a.status)));
+    }));
+    if (!rows.length) body.append(h('tr', null, h('td', { colspan: cols.length },
+      kbs.length ? emptyState('search', 'No matches', 'Try a different search or filter.')
+        : emptyState('keyboard', 'No keyboards yet', 'Add one, then put switches and keycaps on it.', h('button', { class: 'primary', onclick: add }, icon('plus'), 'Add keyboard')))));
+  };
+  draw();
+  const layouts = [...new Set([...META.keyboard_layouts.filter(l => kbs.some(a => a.specs.layout === l)), ...kbs.map(a => a.specs.layout).filter(Boolean)])];
+  const statuses = [...new Set(kbs.map(a => a.status).filter(Boolean))];
+  return [
+    h('div', { class: 'page-head' },
+      h('div', null, h('h1', null, 'Keyboards'), h('div', { class: 'sub' }, 'Boards and the switches and keycaps on them')),
+      h('div', { class: 'actions' },
+        h('a', { class: 'btn', href: '#/inventory?cat=switch' }, icon('kbswitch'), 'Switches'),
+        h('a', { class: 'btn', href: '#/inventory?cat=keycaps' }, icon('keycap'), 'Keycaps'),
+        h('button', { class: 'primary', onclick: add }, icon('plus'), 'Add keyboard'))),
+    h('section', { class: 'card' },
+      h('div', { class: 'filters' },
+        searchInput('Search name, switches, keycaps…', KB_FILTERS.q, e => { KB_FILTERS.q = e.target.value; draw(); }),
+        selectEl([['', 'All layouts'], ...layouts], KB_FILTERS.layout, { onchange: e => { KB_FILTERS.layout = e.target.value; draw(); } }),
+        selectEl([['', 'Any status'], ...statuses], KB_FILTERS.status, { onchange: e => { KB_FILTERS.status = e.target.value; draw(); } }),
+        h('span', { class: 'grow' }), count),
+      h('div', { class: 'table-wrap' }, h('table', null, h('thead', null, headRow), body))),
+  ];
+}
+
+async function keyboardView(id) {
+  return keyboardPage(await api('GET', `/api/assets/${id}`));
+}
+
+/** One card per keyboard part category (switches, keycaps, anything added under Settings). */
+function keyboardPartsCard(a, cat, reload) {
+  const parts = a.components.filter(c => c.category === cat.key);
+  const sw = cat.key === 'switch';
+  const n = parts.reduce((s, c) => s + c.qty, 0);
+  const keys = Number(a.specs.keys) || 0;
+  const showQty = sw || parts.some(c => c.qty > 1);
+  const addBtn = (cls) => h('button', { class: cls, onclick: () => addComponentModal(a, reload, cat.key) }, icon('plus'),
+    sw ? 'Add switches' : `Add ${cat.label.toLowerCase()}`);
+  let foot = null;
+  if (sw && (n || keys)) {
+    const diff = n - keys;
+    foot = h('div', { class: 'card-foot' },
+      h('span', null, `${n} switch${n === 1 ? '' : 'es'}${keys ? ` for ${keys} keys` : ''}`),
+      keys && n ? (diff ? h('span', { class: 'pill p-amber' }, diff > 0 ? `${diff} more than keys` : `${-diff} keys without a switch`) : h('span', { class: 'pill p-green' }, 'Every key has a switch')) : null);
+  }
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', null, cat.label, h('span', { class: 'n' }, (sw ? n : parts.length) || '')), parts.length ? addBtn('small') : null),
+    parts.length ? h('div', { class: 'table-wrap' }, h('table', null,
+      h('thead', null, h('tr', null, h('th', null, singular(cat.label)), sw ? h('th', null, 'Type') : cat.fields.length ? h('th', { class: 'hide-sm' }, 'Specs') : null,
+        sw ? h('th', { class: 'num' }, 'Force') : null, showQty ? h('th', { class: 'num' }, 'Qty') : null, h('th', { class: 'hide-sm' }, sw ? 'Where' : 'Notes'), h('th', null, ''))),
+      h('tbody', null, parts.map(c => h('tr', null,
+        h('td', null, h('a', { class: 'ent', href: `#/inventory/${c.id}` }, catIcon(c.category, 'sm'),
+          h('div', null, h('div', { class: 't' }, c.name), c.spare_qty ? h('div', { class: 's' }, `${c.spare_qty} more on hand`) : null))),
+        sw ? h('td', null, switchTypePill(c.specs.type) || h('span', { class: 'faint' }, '—'))
+          : cat.fields.length ? h('td', { class: 'hide-sm' }, specChips(c.category, c.specs, { compact: true })) : null,
+        sw ? h('td', { class: 'num small nowrap' }, c.specs.actuation ? `${c.specs.actuation} gf` : h('span', { class: 'faint' }, '—')) : null,
+        showQty ? h('td', { class: 'num' }, h('span', { class: 'qty' }, c.qty)) : null,
+        h('td', { class: 'small hide-sm' }, (sw ? c.slot : c.install_notes) || h('span', { class: 'faint' }, '—')),
+        rowActions(
+          sw ? iconButton('edit', 'Change count or where', () => editInstallModal(c, a.name, reload)) : null,
+          iconButton('trash', 'Take off', () => removeInstall(c.install_id, `${sw ? `${c.qty}× ` : ''}${c.name} from ${a.name}`, reload), 'danger')),
+      ))))) : emptyState(sw ? 'kbswitch' : 'keycap', sw ? 'No switches recorded' : `No ${cat.label.toLowerCase()} recorded`,
+      sw ? 'Add each kind of switch on this board with how many, like 70 linears and 17 tactiles.' : 'Add one or more sets.', addBtn('primary')),
+    foot);
+}
+
+function keyboardPage(a) {
+  setCrumbs(['Keyboards', '#/keyboards'], [a.name]);
+  NAV.active = 'keyboards';
+  renderNav();
+  const reload = () => route();
+  const deleteKb = async () => {
+    let back = true;
+    const extra = a.components.length ? h('label', { class: 'check' },
+      h('input', { type: 'checkbox', checked: true, onchange: e => { back = e.target.checked; } }), 'Put its switches and keycaps back into stock') : null;
+    if (!(await confirmModal('Delete keyboard', `Delete ${a.name}? This can't be undone.`, 'Delete', extra))) return;
+    await api('DELETE', `/api/assets/${a.id}?return_to_spare=${back}`);
+    toast('Keyboard deleted');
+    location.hash = '#/keyboards';
+  };
+  const conns = a.specs.connections || [];
+  return [
+    h('div', { class: 'record-head' },
+      assetIcon(a, 'lg'),
+      h('div', { class: 'body' },
+        h('div', { class: 'title-row' }, h('h1', null, a.name), statusPill(a.status)),
+        h('div', { class: 'meta' },
+          makerModel(a) && makerModel(a) !== a.name ? h('span', null, icon('tag'), makerModel(a)) : null,
+          a.specs.layout ? h('span', null, icon('keyboard'), a.specs.layout) : null,
+          a.specs.keys ? h('span', null, `${a.specs.keys} keys`) : null,
+          conns.length ? h('span', null, conns.join(' · ')) : null,
+          a.location ? h('span', null, icon('pin'), a.location) : null)),
+      h('div', { class: 'actions' },
+        h('button', { onclick: () => editKeyboardModal(a, reload) }, icon('edit'), 'Edit'),
+        iconButton('trash', 'Delete keyboard', deleteKb, 'danger'))),
+    h('div', { class: 'record-grid' },
+      h('div', null, META.categories.filter(c => c.group === 'keyboard').map(c => keyboardPartsCard(a, c, reload))),
+      h('div', null,
+        h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', null, 'Details'), h('button', { class: 'link small', onclick: () => editKeyboardModal(a, reload) }, 'Edit')),
+          propsList([
+            ['Brand', a.manufacturer], ['Model', a.model], ['Layout', a.specs.layout], ['Total keys', a.specs.keys],
+            ['Connection', conns.length ? h('span', { class: 'chips' }, conns.map(c => h('span', { class: 'chip' }, c))) : null],
+            ['Status', a.status], ['Location', a.location],
+          ])),
+        a.notes ? h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', null, 'Notes')), h('div', { class: 'card-body' }, h('p', { class: 'notes' }, a.notes))) : null,
+        activityCard(a.events))),
   ];
 }
 
@@ -1650,7 +1986,7 @@ async function itemView(id) {
 async function settingsView() {
   setCrumbs(['Settings']);
   const cats = JSON.parse(JSON.stringify(META.categories));
-  const lists = { statuses: META.statuses.join('\n'), asset_types: META.asset_types.join('\n') };
+  const lists = { statuses: META.statuses.join('\n'), asset_types: META.asset_types.join('\n'), keyboard_layouts: META.keyboard_layouts.join('\n') };
   const catBox = h('div');
   const open = new Set();
   const drawCats = () => {
@@ -1672,6 +2008,7 @@ async function settingsView() {
           h('div', { class: 'grid' },
             field('Category name', h('input', { value: c.label, oninput: e => { c.label = e.target.value; } })),
             field('Auto name template', h('input', { value: c.name_template || '', placeholder: 'e.g. {capacity} {type}', oninput: e => { c.name_template = e.target.value; } })),
+            field('Listed under', selectEl([['', 'Inventory (computer parts)'], ['keyboard', 'Keyboards']], c.group || '', { onchange: e => { c.group = e.target.value; } })),
             h('div', { class: 'actions', style: 'align-self:end;justify-content:flex-end' },
               h('button', { class: 'small', disabled: ci === 0 || null, onclick: () => { cats.splice(ci - 1, 0, cats.splice(ci, 1)[0]); open.clear(); drawCats(); } }, '↑ Up'),
               h('button', { class: 'small', disabled: ci === cats.length - 1 || null, onclick: () => { cats.splice(ci + 1, 0, cats.splice(ci, 1)[0]); open.clear(); drawCats(); } }, '↓ Down'),
@@ -1693,6 +2030,7 @@ async function settingsView() {
         categories: cats,
         statuses: lists.statuses.split('\n'),
         asset_types: lists.asset_types.split('\n'),
+        keyboard_layouts: lists.keyboard_layouts.split('\n'),
       });
       await loadMeta();
       toast('Settings saved');
@@ -1709,14 +2047,16 @@ async function settingsView() {
           h('button', { class: 'small', onclick: () => { cats.push({ label: 'New category', fields: [], match: ['name'], name_template: '' }); open.add(cats.length - 1); drawCats(); } }, icon('plus'), 'Add category')),
         h('div', { class: 'card-body' },
           h('p', { class: 'muted small', style: 'margin-top:0' },
-            'Each category gets its own fields. The name template builds item names from fields, like {capacity} {type} → “16GB DDR4”. New fields show up as {key} once saved.'),
+            'Each category gets its own fields. The name template builds item names from fields, like {capacity} {type} → “16GB DDR4”; {manufacturer} and {model_number} work too. New fields show up as {key} once saved.'),
           catBox)),
       h('section', { class: 'card' },
         h('div', { class: 'card-head' }, h('h2', null, 'Lists')),
         h('div', { class: 'card-body' },
           field('Asset statuses (one per line)', h('textarea', { value: lists.statuses, style: 'min-height:150px', oninput: e => { lists.statuses = e.target.value; } })),
           h('div', { style: 'height:14px' }),
-          field('Asset types (one per line)', h('textarea', { value: lists.asset_types, style: 'min-height:150px', oninput: e => { lists.asset_types = e.target.value; } }))))),
+          field('Asset types (one per line)', h('textarea', { value: lists.asset_types, style: 'min-height:150px', oninput: e => { lists.asset_types = e.target.value; } })),
+          h('div', { style: 'height:14px' }),
+          field('Keyboard sizes (one per line)', h('textarea', { value: lists.keyboard_layouts, style: 'min-height:150px', oninput: e => { lists.keyboard_layouts = e.target.value; } }))))),
   ];
 }
 
@@ -1725,6 +2065,8 @@ async function settingsView() {
 const ROUTES = [
   [/^#\/assets\/new(?:\?method=(\w+))?$/, 'new', m => newAssetView(m[1])],
   [/^#\/assets\/(\d+)$/, 'assets', m => assetView(m[1])],
+  [/^#\/keyboards\/(\d+)$/, 'keyboards', m => keyboardView(m[1])],
+  [/^#\/keyboards$/, 'keyboards', () => keyboardsView()],
   [/^#\/inventory\/(\d+)$/, 'inventory', m => itemView(m[1])],
   [/^#\/inventory(?:\?cat=(\w+))?$/, 'inventory', m => inventoryView(m[1])],
   [/^#\/review\/(\d+)(?:\?asset=(\d+))?$/, 'scans', m => reviewView(m[1], m[2])],

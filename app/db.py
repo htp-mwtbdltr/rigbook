@@ -168,11 +168,31 @@ DEFAULT_CATEGORIES = [
     {"key": "other", "label": "Other", "name_template": "", "match": ["name"], "fields": []},
 ]
 
+# Parts that go into keyboards rather than computers; listed under Keyboards, not Inventory
+KEYBOARD_CATEGORIES = [
+    {
+        "key": "switch", "label": "Switches", "group": "keyboard", "name_template": "{manufacturer} {model_number}",
+        "match": ["name"],
+        "fields": [
+            {"key": "type", "label": "Type", "type": "select",
+             "options": _sel("Linear", "Tactile", "Clicky", "Silent linear", "Silent tactile")},
+            {"key": "actuation", "label": "Actuation force (gf)", "type": "number"},
+        ],
+    },
+    {
+        "key": "keycaps", "label": "Keycaps", "group": "keyboard", "name_template": "{manufacturer} {model_number}",
+        "match": ["name"], "fields": [],
+    },
+]
+DEFAULT_CATEGORIES += KEYBOARD_CATEGORIES
+KEYBOARD_LAYOUTS = ["40%", "60%", "65%", "75%", "TKL (80%)", "96%", "Full size (100%)", "Split", "Other"]
+KEYBOARD_CONNECTIONS = ["Wired", "2.4GHz", "Bluetooth"]
+
 DEFAULT_STATUSES = ["In use", "Spare", "Wiped", "For sale", "Broken", "Retired"]
 NETWORK_TYPES = ["Switch", "Access point", "Router", "Firewall"]
 DEFAULT_ASSET_TYPES = ["Desktop", "SFF PC", "Mini PC", "Custom PC", "Laptop", "Server", *NETWORK_TYPES, "Other"]
 # Columns added after the first release: (name, type)
-ASSET_COLUMNS = [("macs", "TEXT"), ("snmp", "TEXT"), ("arp", "TEXT")]
+ASSET_COLUMNS = [("macs", "TEXT"), ("snmp", "TEXT"), ("arp", "TEXT"), ("kind", "TEXT"), ("specs", "TEXT")]
 
 
 def now():
@@ -212,6 +232,7 @@ def init():
             "categories": DEFAULT_CATEGORIES,
             "statuses": DEFAULT_STATUSES,
             "asset_types": DEFAULT_ASSET_TYPES,
+            "keyboard_layouts": KEYBOARD_LAYOUTS,
         }
         for key, value in defaults.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, json.dumps(value)))
@@ -227,6 +248,12 @@ def init():
                 at = types.index("Other") if "Other" in types else len(types)
                 set_setting(conn, "asset_types", types[:at] + missing + types[at:])
             set_setting(conn, "network_types_added", True)
+        # Keyboard part categories, once, for databases created before them
+        if get_setting(conn, "keyboard_categories_added") is None:
+            cats = get_setting(conn, "categories")
+            have_keys = {c["key"] for c in cats}
+            set_setting(conn, "categories", cats + [c for c in KEYBOARD_CATEGORIES if c["key"] not in have_keys])
+            set_setting(conn, "keyboard_categories_added", True)
 
 
 def get_setting(conn, key):

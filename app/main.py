@@ -19,7 +19,7 @@ from .db import db, item_row, log, now
 
 STATIC = Path(__file__).parent / "static"
 APP_PASSWORD = os.environ.get("RIGBOOK_PASSWORD", "")
-ASSET_FIELDS = ["name", "asset_type", "status", "location", "hostname", "address", "os", "manufacturer",
+ASSET_FIELDS = ["kind", "name", "asset_type", "status", "location", "hostname", "address", "os", "manufacturer",
                 "model", "model_number", "serial", "notes", "scan_user", "macs"]
 SNMP_KEYS = ["version", "user", "level", "auth_proto", "priv_proto"]
 SNMP_SECRETS = ["community", "auth_pass", "priv_pass"]
@@ -64,6 +64,7 @@ def norm(value):
 
 
 def render_name(cat, specs, fallback=""):
+    """Fill the category's name template; it can use spec keys plus {manufacturer} and {model_number}."""
     template = (cat or {}).get("name_template") or ""
     if not template:
         return fallback
@@ -330,7 +331,8 @@ def create_item(conn, data):
     if category not in cats:
         raise HTTPException(400, "Unknown category")
     specs = {k: clean(v) for k, v in (data.get("specs") or {}).items() if v not in (None, "")}
-    name = clean(data.get("name")) or render_name(cats[category], specs)
+    name = clean(data.get("name")) or render_name(cats[category], {
+        **specs, "manufacturer": clean(data.get("manufacturer")) or "", "model_number": clean(data.get("model_number")) or ""})
     if not name:
         raise HTTPException(400, "Name is required")
     cur = conn.execute(
@@ -347,6 +349,10 @@ def save_asset(conn, data, asset_id=None):
     fields = {k: clean(data[k]) or "" for k in ASSET_FIELDS if k in data and k != "macs"}
     if "macs" in data:
         fields["macs"] = ", ".join(mac_list(data["macs"]))
+    if fields.get("kind") not in (None, "", "keyboard"):
+        raise HTTPException(400, "Unknown asset kind")
+    if isinstance(data.get("specs"), dict):
+        fields["specs"] = json.dumps({k: clean(v) for k, v in data["specs"].items() if v not in (None, "", [])})
     if asset_id is None:
         if not fields.get("name"):
             raise HTTPException(400, "Name is required")
@@ -376,6 +382,8 @@ def meta():
             "categories": store.get_setting(conn, "categories"),
             "statuses": store.get_setting(conn, "statuses"),
             "asset_types": store.get_setting(conn, "asset_types"),
+            "keyboard_layouts": store.get_setting(conn, "keyboard_layouts") or store.KEYBOARD_LAYOUTS,
+            "keyboard_connections": store.KEYBOARD_CONNECTIONS,
             "locations": locations,
             "pending_scans": conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0],
         }
@@ -410,13 +418,14 @@ def save_settings(data: dict = Body(...)):
                     fields.append(field)
                 match = [m for m in c.get("match") or [] if m == "name" or m in fkeys] or ["name"]
                 cats.append({"key": key, "label": label, "fields": fields, "match": match,
-                             "name_template": clean(c.get("name_template")) or ""})
+                             "name_template": clean(c.get("name_template")) or "",
+                             "group": "keyboard" if c.get("group") == "keyboard" else ""})
             used = {r[0] for r in conn.execute("SELECT DISTINCT category FROM items")}
             missing = used - seen
             if missing:
                 raise HTTPException(400, f"Categories still in use can't be removed: {', '.join(sorted(missing))}")
             store.set_setting(conn, "categories", cats)
-        for key in ("statuses", "asset_types"):
+        for key in ("statuses", "asset_types", "keyboard_layouts"):
             if key in data:
                 store.set_setting(conn, key, [s.strip() for s in data[key] if s.strip()])
     return meta()
@@ -429,13 +438,19 @@ def list_assets():
     with db() as conn:
         cats = store.categories(conn)
         assets = [dict(r) for r in conn.execute(
-            "SELECT id, name, asset_type, status, location, hostname, address, os, manufacturer, model, serial, last_scan "
-            "FROM assets ORDER BY name COLLATE NOCASE")]
+            "SELECT id, name, asset_type, status, location, hostname, address, os, manufacturer, model, serial, last_scan, "
+            "kind, specs FROM assets ORDER BY name COLLATE NOCASE")]
         ports = {r["asset_id"]: {"total": r["total"], "up": r["up"]} for r in conn.execute(
             "SELECT asset_id, SUM(kind = 'ethernet') AS total, SUM(kind = 'ethernet' AND oper = 'up') AS up "
             "FROM ports GROUP BY asset_id")}
         for a in assets:
-            a["summary"] = summarize(asset_components(conn, a["id"]), cats)
+            comps = asset_components(conn, a["id"])
+            a["summary"] = summarize(comps, cats)
+            a["counts"] = {}
+            for c in comps:
+                a["counts"][c["category"]] = a["counts"].get(c["category"], 0) + c["qty"]
+            a["kind"] = a["kind"] or ""
+            a["specs"] = json.loads(a["specs"] or "{}")
             a["ports"] = ports.get(a["id"])
         return assets
 
@@ -452,6 +467,8 @@ def get_asset(asset_id: int):
         asset = fetch_asset(conn, asset_id)
         asset.pop("raw_scan", None)
         asset.pop("arp", None)
+        asset["kind"] = asset["kind"] or ""
+        asset["specs"] = json.loads(asset["specs"] or "{}")
         profile = json.loads(asset.pop("snmp", None) or "null")
         asset["snmp"] = {k: profile.get(k) or "" for k in SNMP_KEYS} if profile else None
         asset["snmp_saved"] = bool(profile and profile.get("remember"))
@@ -546,7 +563,7 @@ def get_item(item_id: int):
         item = fetch_item(conn, item_id)
         item["installs"] = [dict(r) for r in conn.execute(
             """SELECT i.id AS install_id, i.qty, i.slot, i.serial, i.notes, a.id AS asset_id, a.name AS asset_name,
-                      a.status AS asset_status, a.asset_type, a.location AS asset_location
+                      a.status AS asset_status, a.asset_type, a.kind AS asset_kind, a.location AS asset_location
                FROM installs i JOIN assets a ON a.id = i.asset_id WHERE i.item_id = ?
                ORDER BY a.name COLLATE NOCASE, i.slot""", (item_id,))]
         item["installed_qty"] = sum(i["qty"] for i in item["installs"])
