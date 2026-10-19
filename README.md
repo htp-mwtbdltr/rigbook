@@ -42,8 +42,8 @@ This folder holds everything needed to rebuild the container. These things were 
 ## Quick start (recreating from scratch)
 
 ```bash
-git clone http://git.proxub/billy/my_containers.git
-cd my_containers/rigbook
+git clone http://git.proxub/billy/rigbook.git
+cd rigbook
 
 cp .env.example .env            # optional: set RIGBOOK_PASSWORD / RIGBOOK_URL
 mkdir -p data                   # or copy an old data/ folder in to restore
