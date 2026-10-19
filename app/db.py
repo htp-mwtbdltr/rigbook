@@ -168,6 +168,9 @@ DEFAULT_CATEGORIES = [
     {"key": "other", "label": "Other", "name_template": "", "match": ["name"], "fields": []},
 ]
 
+KEYCAP_PROFILES = _sel("Cherry", "OEM", "SA", "DSA", "XDA", "XVX", "KAT", "KAM", "MT3", "MDA", "ASA", "OSA", "DCS",
+                       "Low profile", "Other")
+
 # Parts that go into keyboards rather than computers; listed under Keyboards, not Inventory
 KEYBOARD_CATEGORIES = [
     {
@@ -181,8 +184,12 @@ KEYBOARD_CATEGORIES = [
         ],
     },
     {
-        "key": "keycaps", "label": "Keycaps", "group": "keyboard", "name_template": "{manufacturer} {model_number}",
-        "match": ["name"], "fields": [],
+        "key": "keycaps", "label": "Keycaps", "group": "keyboard", "name_template": "{manufacturer} {profile} {model_number}",
+        "match": ["name"],
+        "fields": [
+            {"key": "profile", "label": "Profile", "type": "select", "options": KEYCAP_PROFILES},
+            {"key": "link", "label": "Product link", "type": "url"},
+        ],
     },
 ]
 DEFAULT_CATEGORIES += KEYBOARD_CATEGORIES
@@ -264,6 +271,32 @@ def init():
                     c["fields"].insert(at, {"key": "bottom_out", "label": "Bottom-out force (gf)", "type": "number"})
             set_setting(conn, "categories", cats)
             set_setting(conn, "switch_bottom_out_added", True)
+        if get_setting(conn, "keycaps_profile_link_added") is None:
+            _add_keycap_profile_and_link(conn)
+            set_setting(conn, "keycaps_profile_link_added", True)
+
+
+def _add_keycap_profile_and_link(conn):
+    """Give keycaps a profile and a product link, once. Links typed into the per-keyboard notes move onto the set."""
+    cats = get_setting(conn, "categories")
+    new = next(c for c in KEYBOARD_CATEGORIES if c["key"] == "keycaps")
+    for c in cats:
+        if c["key"] != "keycaps":
+            continue
+        have = {f["key"] for f in c["fields"]}
+        c["fields"] += [f for f in new["fields"] if f["key"] not in have]
+        if c.get("name_template") in ("", "{manufacturer} {model_number}"):
+            c["name_template"] = new["name_template"]
+    set_setting(conn, "categories", cats)
+    rows = conn.execute(
+        """SELECT i.id, i.notes, it.id AS item_id, it.specs FROM installs i JOIN items it ON it.id = i.item_id
+           WHERE it.category = 'keycaps' AND i.notes LIKE 'http%'""").fetchall()
+    for r in rows:
+        specs = json.loads(r["specs"] or "{}")
+        if not specs.get("link") and re.fullmatch(r"https?://\S+", r["notes"].strip()):
+            specs["link"] = r["notes"].strip()
+            conn.execute("UPDATE items SET specs = ?, updated_at = ? WHERE id = ?", (json.dumps(specs), now(), r["item_id"]))
+            conn.execute("UPDATE installs SET notes = '' WHERE id = ?", (r["id"],))
 
 
 def get_setting(conn, key):

@@ -69,7 +69,8 @@ def render_name(cat, specs, fallback=""):
     if not template:
         return fallback
     name = re.sub(r"\{(\w+)\}", lambda m: str(specs.get(m.group(1), "")), template)
-    return re.sub(r"\s+", " ", name).strip() or fallback
+    name = re.sub(r"\s+", " ", name).strip()
+    return re.sub(r"(?i)(^|\s)(\S+)(?:\s\2)+(?=\s|$)", r"\1\2", name) or fallback
 
 
 def capacity_gb(text):

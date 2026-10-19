@@ -220,7 +220,15 @@ function splitLabel(label) {
   return m ? [m[1], m[2]] : [label, ''];
 }
 
+function linkHost(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return url; }
+}
+
 function specValue(field, value) {
+  if (field.type === 'url') {
+    return h('a', { href: value, target: '_blank', rel: 'noopener noreferrer', class: 'ext-link', title: value, onclick: e => e.stopPropagation() },
+      linkHost(value), ' ↗');
+  }
   const unit = splitLabel(field.label)[1];
   return unit && field.type !== 'select' ? `${value} ${unit}` : value;
 }
@@ -235,7 +243,7 @@ function specChips(catKey, specs, opts = {}) {
     if (!v) continue;
     shown.add(f.key);
     const label = splitLabel(f.label)[0];
-    let text = specValue(f, v), key = f.type === 'select' ? null : label;
+    let text = specValue(f, v), key = f.type === 'select' || f.type === 'url' ? null : label;
     if (opts.compact && key) {
       // "4 cores", "Boost 4.8 GHz", "16GB": short, but still says what the number is
       const unit = splitLabel(f.label)[1];
@@ -254,7 +262,9 @@ function specChips(catKey, specs, opts = {}) {
 function renderName(cat, specs, fallback) {
   const tpl = (cat && cat.name_template) || '';
   if (!tpl) return fallback || '';
-  const name = tpl.replace(/\{(\w+)\}/g, (_, k) => (specs && specs[k]) || '').replace(/\s+/g, ' ').trim();
+  // "XVX" brand + "XVX" profile gives "XVX Coffee", not "XVX XVX Coffee"
+  const name = tpl.replace(/\{(\w+)\}/g, (_, k) => (specs && specs[k]) || '').replace(/\s+/g, ' ').trim()
+    .replace(/(^|\s)(\S+)(?:\s\2)+(?=\s|$)/gi, '$1$2');
   return name || fallback || '';
 }
 
@@ -308,7 +318,8 @@ function specInputs(catKey, specs, onChange) {
       });
     } else {
       input = h('input', {
-        type: f.type === 'number' ? 'number' : 'text', value: specs[f.key] || '',
+        type: f.type === 'number' ? 'number' : f.type === 'url' ? 'url' : 'text', value: specs[f.key] || '',
+        placeholder: f.type === 'url' ? 'https://…' : null,
         oninput: e => onChange(f.key, e.target.value, false),
         onchange: e => onChange(f.key, e.target.value, true),
       });
@@ -596,13 +607,14 @@ function editAssetModal(asset, onSaved) {
 
 function itemFormFields(data, opts = {}) {
   data.specs = data.specs || {};
-  let nameTouched = !!data.name;
+  const templateName = () => renderName(CATS[data.category], { ...data.specs, manufacturer: data.manufacturer, model_number: data.model_number }, '');
+  let nameTouched = !!data.name && !(CATS[data.category] && CATS[data.category].name_template && data.name === templateName());
   const nameInput = h('input', { value: data.name || '', oninput: e => { data.name = e.target.value; nameTouched = !!e.target.value; } });
   const specsBox = h('div', { class: 'grid' });
   const kb = isKbCat(data.category);
   const autoName = () => {
     if (nameTouched) return;
-    data.name = renderName(CATS[data.category], { ...data.specs, manufacturer: data.manufacturer, model_number: data.model_number }, '');
+    data.name = templateName();
     nameInput.value = data.name;
   };
   const drawSpecs = () => {
@@ -625,7 +637,7 @@ function itemFormFields(data, opts = {}) {
       field(kb ? 'Brand' : 'Manufacturer', h('input', { value: data.manufacturer || '', oninput: e => { data.manufacturer = e.target.value; autoName(); } })),
       field(kb ? 'Model' : 'Model / part number', h('input', { value: data.model_number || '', oninput: e => { data.model_number = e.target.value; autoName(); } })),
       kb ? field('Name', nameInput) : null,
-      tpl && !nameTouched ? h('div', { class: 'muted small wide' }, kb ? 'Leave the name blank and it fills in from the brand and model.' : 'Leave the name blank and it fills in from the specs below.') : null)),
+      tpl && !nameTouched ? h('div', { class: 'muted small wide' }, kb ? `The name fills in from ${data.category === 'keycaps' ? 'the brand, profile and model' : 'the brand and model'}.` : 'Leave the name blank and it fills in from the specs below.') : null)),
     section('Specifications', specsBox),
     opts.hideStock ? null : section('Stock', h('div', { class: 'grid' },
       field(kb ? (data.category === 'switch' ? 'On hand, not in a keyboard (individual switches)' : 'On hand, not on a keyboard') : 'Spare (not installed)', h('input', { type: 'number', min: 0, value: data.spare_qty ?? 0, oninput: e => { data.spare_qty = e.target.value; } })),
@@ -692,12 +704,9 @@ async function addComponentModal(asset, onDone, category) {
           h('input', { type: 'checkbox', checked: state.take, onchange: e => { state.take = e.target.checked; } }),
           kb ? `Take from stock (${chosen.spare_qty} on hand)` : `Take from spare stock (${chosen.spare_qty} available)`) : null)),
       !state.item_id ? h('div', { class: 'form-section' }, itemFormFields(state.newItem, { lockCategory: true, hideStock: !kb, title: kb ? `New ${catLabel(state.category).toLowerCase()}` : 'New item' })) : null,
-      kb ? section(isSwitch ? 'In this keyboard' : null, h('div', { class: 'grid' },
-        isSwitch ? field('How many', h('input', { type: 'number', min: 1, value: state.qty, oninput: e => { state.qty = e.target.value; } })) : null,
-        field(isSwitch ? 'Where (optional)' : 'Notes', h('input', {
-          value: isSwitch ? state.slot : state.notes, placeholder: isSwitch ? 'e.g. alphas, mods, spacebar' : '',
-          oninput: e => { if (isSwitch) state.slot = e.target.value; else state.notes = e.target.value; },
-        }))))
+      kb ? (isSwitch ? section('In this keyboard', h('div', { class: 'grid' },
+        field('How many', h('input', { type: 'number', min: 1, value: state.qty, oninput: e => { state.qty = e.target.value; } })),
+        field('Where (optional)', h('input', { value: state.slot, placeholder: 'e.g. alphas, mods, spacebar', oninput: e => { state.slot = e.target.value; } })))) : null)
         : section('Install', h('div', { class: 'grid' },
           field('Quantity', h('input', { type: 'number', min: 1, value: state.qty, oninput: e => { state.qty = e.target.value; } })),
           field('Slot', h('input', { value: state.slot, placeholder: 'e.g. DIMM A1, M.2 #2', oninput: e => { state.slot = e.target.value; } })),
@@ -1572,7 +1581,7 @@ async function inventoryView(catParam) {
   const spareCell = n => h('td', { class: 'num' }, n ? h('span', { class: 'pill p-green' }, kb ? `${n}` : `${n} spare`) : h('span', { class: 'qty zero' }, '0'));
   const where = n => kb ? `${n} keyboard${n > 1 ? 's' : ''}` : `${n} machine${n > 1 ? 's' : ''}`;
   const partCell = it => h('td', null, h('a', { class: 'ent', href: `#/inventory/${it.id}`, onclick: e => e.stopPropagation() }, catIcon(it.category),
-    h('div', null, h('div', { class: 't' }, it.name), h('div', { class: 's' }, kb && norm(it.name) === norm(`${it.manufacturer}${it.model_number}`) ? ''
+    h('div', null, h('div', { class: 't' }, it.name), h('div', { class: 's' }, kb && norm(it.name).includes(norm(it.manufacturer)) && norm(it.name).includes(norm(it.model_number)) ? ''
       : [it.manufacturer, it.model_number].filter(Boolean).join(' · ') || catLabel(it.category)))));
   const usedCell = it => h('td', { class: 'num', title: it.asset_count ? `in ${it.asset_count} asset${it.asset_count > 1 ? 's' : ''}` : '' },
     h('span', { class: 'qty' + (it.installed_qty ? '' : ' zero') }, it.installed_qty),
@@ -1919,17 +1928,17 @@ function keyboardPartsCard(a, cat, reload) {
   return h('section', { class: 'card' },
     h('div', { class: 'card-head' }, h('h2', null, cat.label, h('span', { class: 'n' }, (sw ? n : parts.length) || '')), parts.length ? addBtn('small') : null),
     parts.length ? h('div', { class: 'table-wrap' }, h('table', null,
-      h('thead', null, h('tr', null, h('th', null, singular(cat.label)), sw ? h('th', null, 'Type') : cat.fields.length ? h('th', { class: 'hide-sm' }, 'Specs') : null,
-        sw ? h('th', { class: 'num', title: 'Actuation / bottom-out force' }, 'Actuation / bottom-out') : null, showQty ? h('th', { class: 'num' }, 'Qty') : null, h('th', { class: 'hide-sm' }, sw ? 'Where' : 'Notes'), h('th', null, ''))),
+      h('thead', null, h('tr', null, h('th', null, singular(cat.label)), sw ? h('th', null, 'Type') : cat.fields.map(f => h('th', { class: 'hide-sm' }, splitLabel(f.label)[0])),
+        sw ? h('th', { class: 'num', title: 'Actuation / bottom-out force' }, 'Actuation / bottom-out') : null, showQty ? h('th', { class: 'num' }, 'Qty') : null, sw ? h('th', { class: 'hide-sm' }, 'Where') : null, h('th', null, ''))),
       h('tbody', null, parts.map(c => h('tr', null,
         h('td', null, h('a', { class: 'ent', href: `#/inventory/${c.id}` }, catIcon(c.category, 'sm'),
           h('div', null, h('div', { class: 't' }, c.name), c.spare_qty ? h('div', { class: 's' }, `${c.spare_qty} more on hand`) : null))),
         sw ? h('td', null, switchTypePill(c.specs.type) || h('span', { class: 'faint' }, '—'))
-          : cat.fields.length ? h('td', { class: 'hide-sm' }, specChips(c.category, c.specs, { compact: true })) : null,
+          : cat.fields.map(f => h('td', { class: 'small hide-sm' }, c.specs[f.key] ? specValue(f, c.specs[f.key]) : h('span', { class: 'faint' }, '—'))),
         sw ? h('td', { class: 'num small nowrap' }, c.specs.actuation || c.specs.bottom_out
           ? `${c.specs.actuation || '—'} / ${c.specs.bottom_out || '—'} gf` : h('span', { class: 'faint' }, '—')) : null,
         showQty ? h('td', { class: 'num' }, h('span', { class: 'qty' }, c.qty)) : null,
-        h('td', { class: 'small hide-sm' }, (sw ? c.slot : c.install_notes) || h('span', { class: 'faint' }, '—')),
+        sw ? h('td', { class: 'small hide-sm' }, c.slot || h('span', { class: 'faint' }, '—')) : null,
         rowActions(
           sw ? iconButton('edit', 'Change count or where', () => editInstallModal(c, a.name, reload)) : null,
           iconButton('trash', 'Take off', () => removeInstall(c.install_id, `${sw ? `${c.qty}× ` : ''}${c.name} from ${a.name}`, reload), 'danger')),
@@ -1994,7 +2003,7 @@ async function settingsView() {
     setKids(catBox, ...cats.map((c, ci) => {
       const fieldLines = c.fields.map((f, fi) => h('div', { class: 'field-line' },
         h('input', { value: f.label, placeholder: 'Field label', oninput: e => { f.label = e.target.value; } }),
-        selectEl([['text', 'Text'], ['number', 'Number'], ['select', 'List']], f.type, { onchange: e => { f.type = e.target.value; f.options = f.options || []; drawCats(); } }),
+        selectEl([['text', 'Text'], ['number', 'Number'], ['select', 'List'], ['url', 'Link']], f.type, { onchange: e => { f.type = e.target.value; f.options = f.options || []; drawCats(); } }),
         f.type === 'select'
           ? h('input', { value: (f.options || []).join(', '), placeholder: 'Options, comma separated', oninput: e => { f.options = e.target.value.split(','); } })
           : h('span', { class: 'muted small' }, f.key ? `{${f.key}}` : ''),

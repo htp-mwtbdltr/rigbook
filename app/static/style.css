@@ -487,3 +487,4 @@ a.dev:hover { background: var(--accent-soft); color: var(--accent); text-decorat
 .link-row:hover { background: var(--surface-2); text-decoration: none; }
 .link-row .t { font-weight: 600; }
 .link-row .s { color: var(--muted); font-size: 12.5px; }
+a.ext-link { white-space: nowrap; }
