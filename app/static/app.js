@@ -177,9 +177,9 @@ function catIcon(key, size) {
 const TYPE_STYLE = {
   laptop: ['laptop', 'purple'], server: ['server', 'teal'], 'mini pc': ['mini', 'green'], 'sff pc': ['mini', 'green'],
   'custom pc': ['tower', 'blue'], desktop: ['tower', 'blue'],
-  switch: ['switch', 'teal'], 'access point': ['wifi', 'pink'], router: ['router', 'orange'], firewall: ['shield', 'red'],
+  switch: ['switch', 'teal'], 'access point': ['wifi', 'pink'], router: ['router', 'orange'], modem: ['router', 'orange'], firewall: ['shield', 'red'],
 };
-const NETWORK_TYPES = ['switch', 'access point', 'router', 'firewall'];
+const NETWORK_TYPES = ['switch', 'access point', 'router', 'firewall', 'modem'];
 const isNetwork = a => NETWORK_TYPES.includes((a.asset_type || '').toLowerCase()) || !!(a.ports && a.ports.length);
 const fmtSpeed = mbps => !mbps ? '' : mbps >= 1000 ? `${+(mbps / 1000).toFixed(1)}G` : `${mbps}M`;
 function typeIcon(type, size) {
@@ -292,10 +292,14 @@ function datalist(id, values) {
   return h('datalist', { id }, values.map(v => h('option', { value: v })));
 }
 
+/** Options are values, [value, label] pairs, or { group, options } for an optgroup. */
 function selectEl(options, value, props) {
-  const opts = options.map(o => (typeof o === 'string' ? [o, o] : o));
-  if (value && !opts.some(([v]) => v === value)) opts.push([value, value]);
-  const s = h('select', props, opts.map(([v, l]) => h('option', { value: v }, l)));
+  const norm = o => (typeof o === 'string' ? [o, o] : o);
+  const opts = options.map(o => (o && o.group ? { group: o.group, options: o.options.map(norm) } : norm(o)));
+  const flat = opts.flatMap(o => (o.group ? o.options : [o]));
+  if (value && !flat.some(([v]) => v === value)) opts.push([value, value]);
+  const opt = ([v, l]) => h('option', { value: v }, l);
+  const s = h('select', props, opts.map(o => (o.group ? h('optgroup', { label: o.group }, o.options.map(opt)) : opt(o))));
   s.value = value ?? '';
   return s;
 }
@@ -409,6 +413,8 @@ function renderNav() {
     item('#/inventory', 'inventory', 'boxes', 'Inventory', COUNTS.items),
     cats.length ? h('div', { class: 'nav-sub' }, cats.map(catLink)) : null,
     item('#/map', 'map', 'topology', 'Network map'),
+    item('#/racks', 'racks', 'server', 'Racks'),
+    item('#/cabling', 'cabling', 'link', 'Cabling'),
     h('div', { class: 'nav-label' }, 'Keyboards'),
     item('#/keyboards', 'keyboards', 'keyboard', 'Keyboards', COUNTS.keyboards),
     META.categories.filter(c => c.group === 'keyboard').map(catLink),
@@ -567,7 +573,8 @@ const ASSET_SECTIONS = [
   ['Basics', [['name', 'Name'], ['asset_type', 'Type'], ['status', 'Status'], ['location', 'Location']]],
   ['Network', [['hostname', 'Hostname'], ['address', 'IP / address for scans'], ['os', 'Operating system / firmware'], ['macs', 'MAC addresses'],
     ['uplink_id', 'Connected to'], ['uplink_port', 'Port on that device']]],
-  ['Hardware', [['manufacturer', 'Manufacturer'], ['model', 'Model'], ['model_number', 'Model number / SKU'], ['serial', 'Serial number']]],
+  ['Hardware', [['manufacturer', 'Manufacturer'], ['model', 'Model'], ['model_number', 'Model number / SKU'], ['serial', 'Serial number'],
+    ['rack_u', 'Rack units (U)']]],
 ];
 const ASSET_FORM = ASSET_SECTIONS.flatMap(([, fields]) => fields);
 
@@ -581,6 +588,7 @@ function assetFormFields(data, others = []) {
     else if (key === 'asset_type') el = selectEl([['', '—'], ...META.asset_types], data[key] || '', {});
     else if (key === 'status') el = selectEl([['', '—'], ...META.statuses], data[key] || '', {});
     else if (key === 'location') el = h('input', { list: 'dl-locations', value: data[key] || '' });
+    else if (key === 'rack_u') el = h('input', { type: 'number', min: 0.5, max: 60, step: 0.5, value: data[key] || '', placeholder: 'Blank if it isn’t rack-mounted' });
     else if (key === 'macs') el = h('input', { value: Array.isArray(data.macs) ? data.macs.join(', ') : data.macs || '', placeholder: 'Filled in by scans; used to find its switch port' });
     else el = h('input', { value: data[key] || '' });
     el.dataset.key = key;
@@ -933,6 +941,7 @@ async function assetView(id) {
     makerModel(a) ? h('span', null, icon('monitor'), makerModel(a)) : null,
     a.location ? h('span', null, icon('pin'), a.location) : null,
     a.hostname ? h('span', null, icon('globe'), a.hostname) : null,
+    a.rack ? h('a', { href: `#/racks/${a.rack.id}` }, icon('server'), `${a.rack.name} · U${fmtU(a.rack.u_pos)}`) : null,
   ];
 
   return [
@@ -1992,7 +2001,7 @@ async function mapView() {
             os: n.guest_type === 'lxc' ? 'LXC container' : 'Virtual machine', uplink_id: '', uplink_port: '' }, reload) }, icon('plus'), 'Add as asset')));
       return;
     }
-    const how = { proxmox: `Proxmox (${l.guest || 'guest'})`, lldp: 'the switch’s LLDP neighbour table', mac: 'the switch’s MAC table', omada: 'the Omada controller’s client list', manual: 'set by hand', inferred: '' }[l.source] || '';
+    const how = { patch: `your cabling: ${l.via}`, proxmox: `Proxmox (${l.guest || 'guest'})`, lldp: 'the switch’s LLDP neighbour table', mac: 'the switch’s MAC table', omada: 'the Omada controller’s client list', manual: 'set by hand', inferred: '' }[l.source] || '';
     if (n.type === 'internet') { setKids(panel, h('div', { class: 'panel-head' }, h('h3', null, 'Internet'), close), h('p', { class: 'muted small' }, 'Through the firewall’s WAN port.')); return; }
     if (n.type === 'unknown') {
       setKids(panel,
@@ -2099,6 +2108,919 @@ async function mapView() {
         h('span', { class: 'muted small' }, 'Not on the map:'),
         data.unplaced.map(u => h('button', { class: 'chip-btn', title: u.reason, onclick: () => connectionModal(u, reload) },
           typeIcon(u.asset_type, 'sm'), u.name, h('span', { class: 'faint' }, ` · ${u.reason}`)))) : null),
+  ];
+}
+
+// ------------------------------------------------------------------ racks
+
+const RACK_U = 30;                       // px per U
+const RACK_INNER = { 19: 600, 10: 300 }; // px between the rails
+const RACK_RAIL = 26;
+const RACK_HEIGHTS = [4, 6, 9, 12, 15, 18, 22, 24, 27, 32, 42, 45, 48];
+const RACK_KINDS = [['patch_panel', 'Patch panel', 1, 24], ['shelf', 'Shelf', 1], ['blank', 'Blank panel', 1], ['monitor', 'Monitor', 8],
+  ['kvm', 'Keyboard drawer', 1], ['cable_mgmt', 'Cable management', 1], ['power', 'Power (UPS, PDU)', 1], ['other', 'Other', 1]];
+const kindLabel = k => k === 'wall_plate' ? 'Wall plate' : (RACK_KINDS.find(x => x[0] === k) || [k, 'Other'])[1];
+const rackName = it => it.asset_name || it.label || kindLabel(it.kind);
+// Inside width of the rack in inches, for things that sit in it without being mounted
+const RACK_IN = { 19: 17.75, 10: 8.75 };
+const U_IN = 1.75;
+const uRange = it => it.u_height <= 1 ? `U${fmtU(it.u_pos)}` : `U${fmtU(it.u_pos)}–${fmtU(it.u_pos + Math.ceil(it.u_height) - 1)}`;
+const fmtU = n => String(Math.round(n * 100) / 100);
+const MAP_SOURCES = { lldp: 'LLDP', mac: 'MAC table', manual: 'set by hand', inferred: 'behind an unmanaged switch', omada: 'Omada', proxmox: 'Proxmox' };
+const RACK = { cables: true, sel: null };
+const CAB = { view: null, sel: null, front: true };
+
+// Patch panels and wall plates pass a cable through: whatever's on the front of port 16 carries on out of the back
+const isPanel = it => it.kind === 'patch_panel' || it.kind === 'wall_plate';
+// A chain is looked up by any of its ends: an asset's port, or a panel's port
+const endKey = (it, port) => it.asset_id ? `a:${it.asset_id}:${port}` : `i:${it.id}:${port}`;
+const hopKey = hp => `${hp.kind === 'asset' ? 'a' : 'i'}:${hp.id}:${hp.port}`;
+function chainIndex(chains) {
+  const m = new Map();
+  for (const c of chains) for (const hp of c.hops) m.set(hopKey(hp), c);
+  return m;
+}
+
+function rackClass(it) {
+  if (it.kind !== 'asset') return 'k-' + it.kind;
+  const t = (it.asset_type || '').toLowerCase();
+  if (NETWORK_TYPES.includes(t)) return t === 'firewall' || t === 'modem' || t === 'router' ? 'k-edge' : 'k-net';
+  return t === 'server' ? 'k-server' : 'k-pc';
+}
+
+/** A cable run as hops: Main Switch gi16 → Patch panel 16 → Desk wall plate 1 → MAIN-RIG. */
+function chainView(c, opts = {}) {
+  if (!c) return h('span', { class: 'faint small' }, 'Not cabled');
+  const out = [];
+  c.hops.forEach((hp, i) => {
+    if (i) out.push(h('span', { class: 'arrow' }, '→'));
+    out.push(hp.kind === 'asset'
+      ? h('a', { class: 'hop dev', href: `#/assets/${hp.id}` }, hp.name, hp.port ? h('span', { class: 'mono' }, hp.port) : null)
+      : h(opts.onPanel ? 'button' : 'span', { class: 'hop panel', type: 'button', title: hp.where ? `${hp.name}, ${hp.where}` : hp.name,
+        onclick: opts.onPanel ? () => opts.onPanel(hp.id) : null }, hp.name, h('span', { class: 'mono' }, hp.port)));
+  });
+  if (c.end) out.push(h('span', { class: 'arrow' }, '→'),
+    h('a', { class: 'hop guess', href: `#/assets/${c.end.id}`, title: 'Not cabled to it yet: it’s what the switch sees on that port' }, c.end.name, h('span', { class: 'faint' }, ' (seen by the switch)')));
+  return h('div', { class: 'chain' + (opts.compact ? ' compact' : '') }, out);
+}
+
+// ---- drawing racks, ports and wall plates (shared by the rack page and the cabling page)
+
+function rackPortEl(it, p, ctx) {
+  const st = it.snmp ? portState(p) : 'na';
+  const lbl = (it.port_labels || {})[p.name];
+  const tip = [`${p.name}${lbl ? ` “${lbl}”` : ''}${p.alias ? ` (${p.alias})` : ''}`,
+    it.snmp ? (st === 'up' ? `Up ${fmtSpeed(p.speed)}` : st === 'off' ? 'Disabled' : 'Down') : '',
+    p.devices.map(d => d.name).join(', '), p.unknown ? `${p.unknown} unknown device${p.unknown > 1 ? 's' : ''}` : ''].filter(Boolean).join('\n');
+  return h('button', { type: 'button', class: `rp-port ${st}${ctx.busy(it, p) ? ' busy' : ''}${ctx.isSel(it, p) ? ' sel' : ''}`,
+    'data-port': p.name, title: tip, 'aria-label': tip.replace(/\n/g, ', '),
+    onclick: e => { e.stopPropagation(); if (!ctx.dragged()) ctx.onPort(it, p); } }, ctx.numbers ? portLabel(p) : null);
+}
+
+// Ports get what they need, up to 13px each, leaving at least 80px for the name
+function rackPortLayout(it, w) {
+  const n = it.port_list.length, patch = isPanel(it);
+  const rows = Math.max(1, Math.min(Math.floor(it.u_height * 2), n > (patch ? 24 : 12) ? 2 : 1));
+  const cols = Math.ceil(n / rows);
+  const size = Math.max(5, Math.min(13, Math.floor((w - 96) / cols) - 2, Math.floor((it.u_height * RACK_U - 8) / rows) - 2));
+  return { rows, cols, size, width: cols * (size + 2) };
+}
+
+function rackPortsEl(it, { rows, cols, size }, ctx) {
+  const ps = it.port_list;
+  // Switches number odd ports on top and even below; patch panels run left to right, row by row
+  const order = rows === 2 && !isPanel(it) ? ps.map((p, i) => ({ p, r: i % 2, c: Math.floor(i / 2) })) : ps.map((p, i) => ({ p, r: Math.floor(i / cols), c: i % cols }));
+  const grid = h('div', { class: 'rp-ports', style: `grid-template-columns:repeat(${cols},${size}px);grid-template-rows:repeat(${rows},${size}px)` });
+  for (const { p, r, c } of order) { const el = rackPortEl(it, p, ctx); el.style.gridRow = r + 1; el.style.gridColumn = c + 1; grid.append(el); }
+  return grid;
+}
+
+/** The rack drawing. ctx: isSel, busy, onPort, dragged, and optionally onItem (click) and onItemDown (drag). */
+function rackFrame(rack, items, ctx) {
+  const inner = RACK_INNER[rack.width];
+  const frame = h('div', { class: `rack-frame w${rack.width}`, style: `width:${inner + RACK_RAIL * 2}px;height:${rack.height_u * RACK_U}px` });
+  for (let u = rack.height_u; u >= 1; u--) {
+    frame.append(h('div', { class: 'rack-u', style: `top:${(rack.height_u - u) * RACK_U}px` }, h('span', { class: 'l' }, u), h('span', { class: 'r' }, u)));
+  }
+  const itemEls = new Map();
+  const topOf = it => (rack.height_u + 1 - it.u_pos - it.u_height) * RACK_U;
+  const redraw = () => {
+    frame.querySelectorAll('.rack-item').forEach(el => el.remove());
+    itemEls.clear();
+    for (const it of items) {
+      const w = it.w * inner, hgt = it.u_height * RACK_U - 2;
+      const lay = it.port_list.length ? rackPortLayout(it, w) : null;
+      const el = h('div', {
+        class: `rack-item ${rackClass(it)}${it.mounted ? '' : ' loose'}${ctx.itemSel && ctx.itemSel(it) ? ' sel' : ''}${it.status && !/in use/i.test(it.status) ? ' idle' : ''}`,
+        style: `top:${topOf(it) + 1}px;left:${RACK_RAIL + it.x * inner}px;width:${w - 2}px;height:${hgt}px`,
+        title: `${rackName(it)} · ${uRange(it)}`, 'data-item': it.id,
+      },
+        h('div', { class: 'ri-name', style: lay ? `width:${w - lay.width - 26}px` : '' },
+          h('span', { class: 't' }, rackName(it)),
+          hgt > 34 ? h('span', { class: 's' }, [it.kind === 'asset' ? makerModel(it) : '', it.mounted ? '' : 'not rack-mounted'].filter(Boolean).join(' · ')) : null),
+        lay ? rackPortsEl(it, lay, ctx) : null);
+      if (ctx.onItemDown) el.addEventListener('pointerdown', e => ctx.onItemDown(e, it, el));
+      else if (ctx.onItem) el.addEventListener('click', e => { if (!ctx.dragged()) { e.stopPropagation(); ctx.onItem(it); } });
+      frame.append(el);
+      itemEls.set(it.id, el);
+    }
+  };
+  redraw();
+  return { frame, itemEls, redraw, topOf, inner };
+}
+
+/** A wall plate, drawn like a single-gang keystone plate: two ports across, as many rows as it needs. */
+function plateEl(pl, ctx) {
+  const cols = Math.min(2, pl.port_list.length) || 1;
+  return h('div', { class: 'plate' + (ctx.itemSel && ctx.itemSel(pl) ? ' sel' : ''), 'data-item': pl.id },
+    h('button', { class: 'plate-name', type: 'button', title: pl.location || '', onclick: e => { e.stopPropagation(); if (!ctx.dragged()) ctx.onItem(pl); } },
+      h('span', { class: 't' }, pl.label), pl.location ? h('span', { class: 's' }, pl.location) : null),
+    h('div', { class: 'plate-face' }, h('div', { class: 'rp-ports', style: `grid-template-columns:repeat(${cols},34px);grid-auto-rows:22px` },
+      pl.port_list.map(p => rackPortEl(pl, p, { ...ctx, numbers: true })))));
+}
+
+/** The port's centre (or the item's), unscaled, in base's coordinates. */
+function centreOf(el, port, base, k = 1) {
+  const target = port ? el.querySelector(`[data-port="${CSS.escape(port)}"]`) : null;
+  const r = (target || el).getBoundingClientRect(), b = base.getBoundingClientRect();
+  return { x: (r.left + r.width / 2 - b.left) / k, y: (r.top + r.height / 2 - b.top) / k };
+}
+
+/** Where a cable meets the item: a port's centre, or the edge of the item facing towardX (the right edge if not given). */
+function anchorOf(el, port, base, k = 1, towardX) {
+  if (!el) return null;
+  const target = port ? el.querySelector(`[data-port="${CSS.escape(port)}"]`) : null;
+  const r = (target || el).getBoundingClientRect(), b = base.getBoundingClientRect();
+  const left = (r.left - b.left) / k, right = (r.right - b.left) / k, y = (r.top + r.height / 2 - b.top) / k;
+  if (target) return { x: (left + right) / 2, y };
+  return { x: towardX != null && towardX < (left + right) / 2 ? left + 6 : right - 6, y };
+}
+
+function cablePath(a, b, gutter) {
+  if (gutter != null) return `M${a.x},${a.y} C${gutter},${a.y} ${gutter},${b.y} ${b.x},${b.y}`;
+  const [p, q] = a.x <= b.x ? [a, b] : [b, a];
+  const dx = Math.max(50, (q.x - p.x) / 2);
+  return `M${p.x},${p.y} C${p.x + dx},${p.y} ${q.x - dx},${q.y} ${q.x},${q.y}`;
+}
+
+function svgEl(tag, attrs) {
+  const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  return e;
+}
+
+// ---- pickers: anything a cable can go to
+
+/** Targets for a cable: devices (by asset) and panels (by item), and the ports each one has. */
+function cabTargets(cab) {
+  const racked = new Map();
+  for (const r of cab.racks) for (const i of r.items) if (i.asset_id) racked.set(i.asset_id, i);
+  const panels = [...cab.racks.flatMap(r => r.items.filter(isPanel).map(i => ({ ...i, where: r.rack.name }))),
+    ...cab.plates.map(p => ({ ...p, where: p.location || 'wall plate' }))];
+  const devs = cab.devices;
+  const ports = val => {
+    if (!val) return null;
+    const id = Number(val.slice(2));
+    if (val.startsWith('i:')) { const p = panels.find(x => x.id === id); return p ? p.port_list.map(x => x.name) : []; }
+    const it = racked.get(id);
+    if (it && it.port_list.length) return it.port_list.map(x => x.name);
+    const d = devs.find(x => x.id === id);
+    return d && d.ports.length ? d.ports : null;
+  };
+  const name = val => {
+    const id = Number(val.slice(2));
+    if (val.startsWith('i:')) { const p = panels.find(x => x.id === id); return p ? `${p.label} (${p.where})` : '?'; }
+    const d = devs.find(x => x.id === id);
+    return d ? d.name : '?';
+  };
+  const options = [
+    { group: 'Switches and network gear', options: devs.filter(d => isNetwork(d)).map(d => [`a:${d.id}`, d.name]) },
+    { group: 'Patch panels and wall plates', options: panels.map(p => [`i:${p.id}`, `${p.label} (${p.where})`]) },
+    { group: 'Other devices', options: devs.filter(d => !isNetwork(d)).map(d => [`a:${d.id}`, d.name]) },
+  ].filter(g => g.options.length);
+  return { options, ports, name, panels, racked };
+}
+
+const endOf = (val, port) => (val.startsWith('a:') ? { asset: Number(val.slice(2)), port } : { item: Number(val.slice(2)), port });
+
+/** Cables at one end. For a rack item that's an asset, that's the asset's port. */
+function linksAt(links, it, port, side) {
+  return links.filter(l => ['a', 'b'].some(e => it.asset_id
+    ? l[`${e}_asset`] === it.asset_id && l[`${e}_port`] === port
+    : l[`${e}_item`] === it.id && l[`${e}_port`] === port && (!side || l[`${e}_side`] === side)));
+}
+
+/** Plug a port into something. Panels pick a side; the far end, if it's a panel, takes a free side. */
+async function connectModal(it, port, onSaved) {
+  const cab = await api('GET', '/api/cabling');
+  const T = cabTargets(cab);
+  const taken = side => linksAt(cab.links, it, port, side).length;
+  const st = { target: '', port: '', side: isPanel(it) ? (taken('front') && !taken('back') ? 'back' : 'front') : '' };
+  const box = h('div');
+  const draw = () => {
+    const ps = T.ports(st.target);
+    setKids(box, h('div', { class: 'grid' },
+      h('p', { class: 'muted small wide', style: 'margin:0' }, `From ${rackName(it)}${port ? ` port ${port}` : ''}. Anything already plugged into either end is unplugged first.`),
+      isPanel(it) ? field('Side', selectEl([['front', `Front${taken('front') ? ' (in use)' : ''}`], ['back', `Back${taken('back') ? ' (in use)' : ''}`]], st.side, { onchange: e => { st.side = e.target.value; } })) : null,
+      field('Goes to', selectEl([['', 'Choose…'], ...T.options], st.target, { onchange: e => { st.target = e.target.value; st.port = ''; draw(); } }), 'wide'),
+      st.target ? (ps ? field('Port', selectEl([['', ps.length ? 'Choose…' : 'No ports'], ...ps], st.port, { onchange: e => { st.port = e.target.value; } }))
+        : field('Port (optional)', h('input', { value: st.port, placeholder: 'e.g. eth0, LAN', oninput: e => { st.port = e.target.value; } }))) : null));
+  };
+  draw();
+  openModal('Connect', box, [{ label: 'Cancel' }, { label: 'Connect', class: 'primary', action: async () => {
+    if (!st.target) throw new Error('Choose where it goes');
+    if (T.ports(st.target) && T.ports(st.target).length && !st.port) throw new Error('Choose a port');
+    await api('POST', '/api/links', { a: { item: it.id, port: port || '', side: st.side }, b: endOf(st.target, st.port) });
+    toast('Connected');
+    onSaved();
+  } }], { dialog: true });
+}
+
+/** Port names typed in the bulk filler: "16,17,18,45,46,23", "1-6", or one port to count up from. */
+function parsePorts(text, tports, n) {
+  const tokens = String(text || '').split(/[\s,]+/).filter(Boolean).flatMap(t => {
+    const m = /^(\d+)-(\d+)$/.exec(t);
+    if (!m) return [t];
+    const out = [];
+    for (let i = +m[1]; m[1] <= m[2] ? i <= +m[2] : i >= +m[2]; i += m[1] <= m[2] ? 1 : -1) out.push(String(i));
+    return out;
+  });
+  if (!tports) {
+    if (tokens.length && tokens.length !== n) throw new Error(`That’s ${tokens.length} ports for ${n}`);
+    return tokens.length ? tokens : Array(n).fill('');
+  }
+  const find = t => tports.find(p => p.toLowerCase() === t.toLowerCase()) || tports.find(p => portLabel({ name: p }) === t);
+  if (!tokens.length) throw new Error('Say which ports on the other end');
+  if (tokens.length === 1 && n > 1) {
+    const start = tports.indexOf(find(tokens[0]));
+    if (start < 0) throw new Error(`There’s no port ${tokens[0]} there`);
+    if (start + n > tports.length) throw new Error(`There aren’t ${n} ports from ${tokens[0]} on`);
+    return tports.slice(start, start + n);
+  }
+  if (tokens.length !== n) throw new Error(`That’s ${tokens.length} ports on the other end for ${n} here`);
+  return tokens.map(t => { const p = find(t); if (!p) throw new Error(`There’s no port ${t} there`); return p; });
+}
+
+/** Every port of a patch panel or wall plate, with what's on its front and back and where the run ends up. */
+async function patchEditor(itemId, onDone) {
+  let cab, it, T, chains;
+  const body = h('div', { class: 'patch-ed' });
+  const bulk = { from: '', to: '', side: 'front', target: '', ports: '' };
+  const load = async () => {
+    cab = await api('GET', '/api/cabling');
+    it = [...cab.racks.flatMap(r => r.items.map(i => ({ ...i, where: r.rack.name }))), ...cab.plates.map(p => ({ ...p, where: p.location }))].find(i => i.id === itemId);
+    T = cabTargets(cab);
+    chains = chainIndex(cab.chains);
+    if (!bulk.from && it.port_list.length) { bulk.from = it.port_list[0].name; bulk.to = it.port_list[it.port_list.length - 1].name; }
+    draw();
+  };
+  const run = async fn => { try { await fn(); await load(); } catch (e) { toast(e.message, true); } };
+  const otherEnd = (l, port, side) => {
+    const e = l.a_item === it.id && l.a_port === port && l.a_side === side ? 'b' : 'a';
+    return { val: l[`${e}_asset`] ? `a:${l[`${e}_asset`]}` : `i:${l[`${e}_item`]}`, port: l[`${e}_port`] };
+  };
+  const cell = (port, side) => {
+    const l = linksAt(cab.links, it, port, side)[0];
+    const st = l ? otherEnd(l, port, side) : { val: '', port: '' };
+    const commit = () => run(async () => {
+      if (!st.val) { if (l) await api('DELETE', `/api/links/${l.id}`); return; }
+      await api('POST', '/api/links', { a: { item: it.id, port, side }, b: endOf(st.val, st.port) });
+    });
+    const pbox = h('span', { class: 'pe-port' });
+    const drawPort = () => {
+      const ps = T.ports(st.val);
+      setKids(pbox, !st.val ? null : ps
+        ? selectEl([['', 'port?'], ...ps], st.port, { class: st.port || !ps.length ? '' : 'need', title: st.port ? '' : 'Which port? The cable is saved without one until you pick it',
+          onchange: e => { st.port = e.target.value; commit(); } })
+        : h('input', { value: st.port, placeholder: 'port', onchange: e => { st.port = e.target.value.trim(); commit(); } }));
+    };
+    drawPort();
+    const tsel = selectEl([['', '—'], ...T.options], st.val, { onchange: e => {
+      st.val = e.target.value;
+      // Save straight away, so nothing is lost waiting on a port: a device with one port gets it, otherwise the
+      // port is left blank (and flagged) until one is picked
+      const ps = T.ports(st.val);
+      st.port = ps && ps.length === 1 ? ps[0] : '';
+      commit();
+    } });
+    return h('td', { class: 'pe-cell' + (l ? ' set' : '') }, h('div', { class: 'pe-pick' }, tsel, pbox));
+  };
+  const saveLabel = (port, v) => run(async () => {
+    const labels = { ...(it.port_labels || {}), [port]: v };
+    await api('PUT', `/api/rack-items/${it.id}`, { port_labels: labels });
+  });
+  const applyBulk = () => run(async () => {
+    const mine = it.port_list.map(p => p.name);
+    const i0 = mine.indexOf(bulk.from), i1 = mine.indexOf(bulk.to);
+    if (i0 < 0 || i1 < 0 || i1 < i0) throw new Error('Pick a range of this panel’s ports');
+    if (!bulk.target) throw new Error('Pick where they go');
+    const src = mine.slice(i0, i1 + 1);
+    const dst = parsePorts(bulk.ports, T.ports(bulk.target), src.length);
+    await api('POST', '/api/links/batch', { links: src.map((p, k) => ({ a: { item: it.id, port: p, side: bulk.side }, b: endOf(bulk.target, dst[k]) })) });
+    toast(`Connected ${src.length} port${src.length > 1 ? 's' : ''}`);
+  });
+  const draw = () => {
+    const plate = it.kind === 'wall_plate';
+    const portSel = key => selectEl(it.port_list.map(p => p.name), bulk[key], { onchange: e => { bulk[key] = e.target.value; } });
+    setKids(body,
+      h('div', { class: 'pe-bulk' },
+        h('strong', { class: 'small' }, 'Fill several'),
+        h('span', { class: 'small muted' }, 'Ports'), portSel('from'), h('span', { class: 'small muted' }, 'to'), portSel('to'),
+        selectEl([['front', 'front'], ['back', 'back']], bulk.side, { onchange: e => { bulk.side = e.target.value; } }),
+        h('span', { class: 'small muted' }, 'go to'),
+        selectEl([['', 'Choose…'], ...T.options], bulk.target, { onchange: e => { bulk.target = e.target.value; } }),
+        h('input', { value: bulk.ports, placeholder: 'ports: 16,17,18,45,46,23 or 1-6 or 1', oninput: e => { bulk.ports = e.target.value; } }),
+        h('button', { class: 'small primary', onclick: applyBulk }, 'Apply')),
+      h('p', { class: 'faint small', style: 'margin:0 0 10px' },
+        'Each port passes through: what’s on its front carries on out of its back. Cables from devices and switches usually go on the front, cable runs to other panels on the back. ',
+        'Plugging into a port that’s in use replaces what was there.'),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'pe-table' },
+        h('thead', null, h('tr', null, h('th', null, 'Port'), h('th', null, 'Label'),
+          h('th', null, plate ? 'Front (room side)' : 'Front (patch cord)'), h('th', null, plate ? 'Back (in the wall)' : 'Back (cable run)'), h('th', null, 'Where it ends up'))),
+        h('tbody', null, it.port_list.map(p => h('tr', null,
+          h('td', { class: 'mono nowrap' }, p.name),
+          h('td', null, h('input', { class: 'pe-label', value: (it.port_labels || {})[p.name] || '', placeholder: plate ? 'e.g. Desk' : 'e.g. Office 2', onchange: e => saveLabel(p.name, e.target.value.trim()) })),
+          cell(p.name, 'front'), cell(p.name, 'back'),
+          h('td', { class: 'pe-path' }, chainView(chains.get(endKey(it, p.name)), { compact: true }))))))));
+  };
+  await load();
+  openModal(`Patching: ${it.label}${it.where ? ` (${it.where})` : ''}`, body, [{ label: 'Done', class: 'primary' }], { wide: true, onClose: onDone });
+}
+
+// ---- pages
+
+async function racksView() {
+  setCrumbs(['Racks']);
+  const racks = await api('GET', '/api/racks');
+  const reload = () => route();
+  return [
+    h('div', { class: 'page-head' },
+      h('div', null, h('h1', null, 'Racks'), h('div', { class: 'sub' }, 'What’s mounted where, and how it’s cabled')),
+      h('div', { class: 'actions' },
+        h('a', { class: 'btn', href: '#/cabling' }, icon('link'), 'Cabling'),
+        h('button', { class: 'primary', onclick: () => rackModal(null, reload) }, icon('plus'), 'New rack'))),
+    racks.length ? h('div', { class: 'rack-cards' }, racks.map(r => h('a', { class: 'card rack-card', href: `#/racks/${r.id}` },
+      h('div', { class: 'rack-mini', style: `height:${Math.max(36, Math.min(110, r.height_u * 2.4))}px;width:${r.width === 10 ? 22 : 40}px` },
+        h('div', { class: 'fill', style: `height:${Math.min(100, 100 * r.used_u / r.height_u)}%` })),
+      h('div', null, h('div', { class: 'strong' }, r.name),
+        h('div', { class: 'muted small' }, `${r.width}″ · ${r.height_u}U${r.location ? ` · ${r.location}` : ''}`),
+        h('div', { class: 'faint small' }, `${r.items} item${r.items === 1 ? '' : 's'} · ${fmtU(r.height_u - r.used_u)}U free`)))))
+      : h('section', { class: 'card' }, emptyState('server', 'No racks yet', 'Add a rack, then mount your assets, patch panels and shelves in it.',
+        h('button', { class: 'primary', onclick: () => rackModal(null, reload) }, icon('plus'), 'New rack'))),
+  ];
+}
+
+function rackModal(rack, onSaved) {
+  const st = rack ? { ...rack } : { name: '', width: 19, height_u: 42, location: '', notes: '' };
+  let custom = !RACK_HEIGHTS.includes(Number(st.height_u));
+  const customBox = h('div');
+  const drawCustom = () => setKids(customBox, custom ? field('Height in U', h('input', { type: 'number', min: 1, max: 60, value: st.height_u, oninput: e => { st.height_u = e.target.value; } })) : null);
+  drawCustom();
+  const heightSel = selectEl([...RACK_HEIGHTS.map(n => [String(n), `${n}U`]), ['custom', 'Other…']], custom ? 'custom' : String(st.height_u), {
+    onchange: e => { custom = e.target.value === 'custom'; if (!custom) st.height_u = Number(e.target.value); drawCustom(); } });
+  const del = rack ? { label: 'Delete rack', class: 'danger', action: async () => {
+    if (!(await confirmModal('Delete rack', `Delete ${rack.name}? Everything in it comes out of the rack (the assets themselves stay).`, 'Delete'))) return false;
+    await api('DELETE', `/api/racks/${rack.id}`);
+    toast('Rack deleted');
+    location.hash = '#/racks';
+  } } : null;
+  openModal(rack ? 'Edit rack' : 'New rack', h('div', { class: 'grid' },
+    field('Name', h('input', { value: st.name, placeholder: 'e.g. Main Rack', oninput: e => { st.name = e.target.value; } }), 'wide'),
+    field('Width', selectEl([['19', '19 inch'], ['10', '10 inch (mini rack)']], String(st.width), { onchange: e => { st.width = Number(e.target.value); } })),
+    field('Height', heightSel),
+    customBox,
+    field('Location', h('input', { list: 'dl-rack-loc', value: st.location, oninput: e => { st.location = e.target.value; } })),
+    datalist('dl-rack-loc', META.locations),
+    field('Notes', h('textarea', { value: st.notes, oninput: e => { st.notes = e.target.value; } }), 'wide')), [
+    ...(del ? [del] : []),
+    { label: 'Cancel' },
+    { label: rack ? 'Save' : 'Create rack', class: 'primary', action: async () => {
+      if (rack) { await api('PUT', `/api/racks/${rack.id}`, st); toast('Rack saved'); onSaved(); return; }
+      const r = await api('POST', '/api/racks', st);
+      location.hash = `#/racks/${r.id}`;
+    } },
+  ], { dialog: true });
+}
+
+/** Add or edit a wall plate: a panel that isn't in a rack. */
+function plateModal(plate, onSaved) {
+  const st = plate ? { label: plate.label, location: plate.location, ports: plate.ports, port_names: plate.port_names, notes: plate.notes }
+    : { label: '', location: '', ports: 2, port_names: '', notes: '' };
+  const del = plate ? { label: 'Delete', class: 'danger', action: async () => {
+    if (!(await confirmModal('Delete wall plate', `Delete ${plate.label} and its cables?`, 'Delete'))) return false;
+    await api('DELETE', `/api/rack-items/${plate.id}`); toast('Deleted'); onSaved();
+  } } : null;
+  openModal(plate ? `Edit ${plate.label}` : 'New wall plate', h('div', { class: 'grid' },
+    field('Name', h('input', { value: st.label, placeholder: 'e.g. Desk wall plate', oninput: e => { st.label = e.target.value; } }), 'wide'),
+    field('Location', h('input', { list: 'dl-plate-loc', value: st.location, placeholder: 'e.g. Office', oninput: e => { st.location = e.target.value; } })),
+    datalist('dl-plate-loc', META.locations),
+    field('Ports', h('input', { type: 'number', min: 1, max: 48, value: st.ports, oninput: e => { st.ports = e.target.value; } })),
+    field('Port names (optional)', h('input', { value: st.port_names, placeholder: 'e.g. 1, 2, 3, Coax', oninput: e => { st.port_names = e.target.value; } }), 'wide'),
+    h('p', { class: 'faint small wide', style: 'margin:0' }, 'Names go on the first ports and the rest are numbered: “Coax” with 6 ports is Coax, 2, 3, 4, 5, 6.'),
+    field('Notes', h('textarea', { value: st.notes, oninput: e => { st.notes = e.target.value; } }), 'wide')), [
+    ...(del ? [del] : []),
+    { label: 'Cancel' },
+    { label: plate ? 'Save' : 'Add wall plate', class: 'primary', action: async () => {
+      if (!st.label.trim()) throw new Error('Give it a name');
+      if (plate) await api('PUT', `/api/rack-items/${plate.id}`, st);
+      else await api('POST', '/api/plates', st);
+      toast(plate ? 'Saved' : 'Wall plate added'); onSaved();
+    } },
+  ], { dialog: true });
+}
+
+/** Add or edit something in a rack. `item` is null to add. */
+async function rackItemModal(data, item, onSaved) {
+  const rack = data.rack;
+  const assets = item ? [] : (await api('GET', '/api/assets')).filter(a => !isKeyboard(a) && (a.status || '').toLowerCase() !== 'wiped');
+  const st = item ? {
+    source: item.kind === 'asset' ? 'asset' : item.kind, asset_id: item.asset_id || '', label: item.label, u_height: item.u_height,
+    ports: item.ports, port_names: item.port_names || '', w: item.w, mounted: item.mounted, u_pos: item.u_pos, notes: item.notes, rack_id: rack.id,
+  } : { source: 'asset', asset_id: '', label: '', u_height: 1, ports: 0, port_names: '', w: 1, mounted: true, u_pos: '', notes: '' };
+  st.w_in = +(st.w * RACK_IN[rack.width]).toFixed(1);
+  st.h_in = +(st.u_height * U_IN).toFixed(1);
+  const racks = item ? await api('GET', '/api/racks') : [];
+  const box = h('div');
+  const asset = () => assets.find(a => String(a.id) === String(st.asset_id));
+  const num = (key, props = {}) => h('input', { type: 'number', step: 'any', value: st[key], ...props, oninput: e => { st[key] = e.target.value; } });
+  const draw = () => {
+    const isAsset = st.source === 'asset';
+    const a = isAsset ? asset() : null;
+    const switchy = isAsset && item ? isNetwork({ asset_type: item.asset_type }) && !item.snmp : a && isNetwork(a) && !(a.ports && a.ports.total);
+    const hasPorts = st.source === 'patch_panel' || switchy || (!isAsset && Number(st.ports));
+    setKids(box, h('div', { class: 'grid' },
+      !item ? field('What are you adding?', selectEl([['asset', 'A device from Rigbook'], ...RACK_KINDS.map(([k, l]) => [k, l])], st.source, { onchange: e => {
+        st.source = e.target.value;
+        const k = RACK_KINDS.find(x => x[0] === st.source);
+        if (k) { st.u_height = k[2]; st.ports = k[3] || 0; }
+        draw();
+      } }), 'wide') : null,
+      isAsset && !item ? field('Device', selectEl([['', 'Choose…'], ...assets.map(x => [String(x.id),
+        `${x.name}${x.rack ? ` (in ${x.rack.name})` : ''}${x.rack_u ? ` · ${fmtU(x.rack_u)}U` : ''}`])], String(st.asset_id), { onchange: e => {
+        st.asset_id = e.target.value;
+        const x = asset();
+        if (x && x.rack_u) { st.u_height = x.rack_u; st.h_in = +(x.rack_u * U_IN).toFixed(1); }
+        draw();
+      } }), 'wide') : null,
+      !isAsset ? field('Label', h('input', { value: st.label, placeholder: kindLabel(st.source), oninput: e => { st.label = e.target.value; } }), 'wide') : null,
+      h('label', { class: 'check wide' }, h('input', { type: 'checkbox', checked: st.mounted, onchange: e => { st.mounted = e.target.checked; draw(); } }),
+        'Rack-mounted', h('span', { class: 'faint' }, ' (untick for things that just sit in the rack, like a tower UPS)')),
+      st.mounted ? [
+        field('Height (U)', num('u_height', { min: 0.5, max: 60 })),
+        field('Width', selectEl([['1', 'Full width'], ['0.5', 'Half (side by side)'], ['0.25', 'Quarter']], String(st.w), { onchange: e => { st.w = Number(e.target.value); } })),
+      ] : [
+        field('Height (inches)', num('h_in', { min: 1 })),
+        field('Width (inches)', num('w_in', { min: 1, max: RACK_IN[rack.width] })),
+      ],
+      hasPorts ? [
+        field(st.source === 'patch_panel' ? 'Number of ports' : 'Number of ports (unmanaged, so scans can’t tell)', num('ports', { min: 0, max: 96 })),
+        field('Port names (optional)', h('input', { value: st.port_names, placeholder: 'e.g. 1, 2, … 8, Uplink 1, Uplink 2', oninput: e => { st.port_names = e.target.value; } })),
+      ] : null,
+      field(item ? 'Bottom U' : 'Bottom U (blank: highest free space)', num('u_pos', { min: 1, max: rack.height_u })),
+      item && racks.length > 1 ? field('Rack', selectEl(racks.map(r => [String(r.id), r.name]), String(st.rack_id), { onchange: e => { st.rack_id = Number(e.target.value); if (st.rack_id !== rack.id) st.u_pos = ''; } })) : null,
+      field('Notes', h('textarea', { value: st.notes, oninput: e => { st.notes = e.target.value; } }), 'wide')));
+  };
+  draw();
+  const body = () => {
+    const out = { label: st.label, notes: st.notes, mounted: st.mounted, ports: Number(st.ports) || 0, port_names: st.port_names,
+      u_pos: st.u_pos === '' ? null : Number(st.u_pos) };
+    if (st.mounted) { out.u_height = Number(st.u_height); out.w = Number(st.w); }
+    else { out.u_height = +(Number(st.h_in) / U_IN).toFixed(2); out.w = Math.min(1, +(Number(st.w_in) / RACK_IN[rack.width]).toFixed(3)); }
+    if (!item) { if (st.source === 'asset') { if (!st.asset_id) throw new Error('Choose a device'); out.asset_id = Number(st.asset_id); } else out.kind = st.source; }
+    if (item && st.rack_id !== rack.id) out.rack_id = st.rack_id;
+    if (item && out.u_pos == null && !out.rack_id) out.u_pos = item.u_pos;
+    if (item && st.mounted && out.w + item.x > 1) out.x = 1 - out.w;
+    return out;
+  };
+  const buttons = [
+    item ? { label: 'Remove from rack', class: 'danger', action: async () => {
+      if (!(await confirmModal('Remove from rack', `Take ${rackName(item)} out of ${rack.name}?${item.kind === 'asset' ? ' The asset itself stays.' : ' Its cables go too.'}`, 'Remove'))) return false;
+      await api('DELETE', `/api/rack-items/${item.id}`); toast('Removed'); onSaved();
+    } } : null,
+    { label: 'Cancel' },
+    { label: item ? 'Save' : 'Add to rack', class: 'primary', action: async () => {
+      if (item) await api('PUT', `/api/rack-items/${item.id}`, body());
+      else await api('POST', `/api/racks/${rack.id}/items`, body());
+      toast(item ? 'Saved' : 'Added'); onSaved();
+    } },
+  ].filter(Boolean);
+  openModal(item ? `Edit ${rackName(item)}` : `Add to ${rack.name}`, box, buttons);
+}
+
+async function rackView(id) {
+  const data = await api('GET', `/api/racks/${id}`);
+  const { rack, items } = data;
+  setCrumbs(['Racks', '#/racks'], [rack.name]);
+  const reload = () => route();
+  const byId = new Map(items.map(i => [i.id, i]));
+  const sel = { item: RACK.sel && byId.has(RACK.sel.item) ? RACK.sel.item : null, port: RACK.sel ? RACK.sel.port : null };
+  const chains = chainIndex(data.chains);
+
+  // Cables drawn here: set by hand (both ends in this rack), and the network map's links between two of its assets
+  const cables = [...data.links.map(l => ({ ...l, kind: 'link' })), ...data.cables.map(c => ({ ...c, kind: 'map' }))];
+  const cablesOf = (itemId, port) => cables.filter(c => (c.a_item === itemId && (!port || c.a_port === port)) || (c.b_item === itemId && (!port || c.b_port === port)));
+  const busy = (it, p) => chains.has(endKey(it, p.name)) || cablesOf(it.id, p.name).length || p.devices.length || (it.port_labels || {})[p.name];
+
+  let drag = null, dragged = false;
+  const ctx = {
+    isSel: (it, p) => sel.item === it.id && sel.port === p.name,
+    itemSel: it => sel.item === it.id,
+    busy, dragged: () => dragged,
+    onPort: (it, p) => select(it.id, p.name),
+    onItemDown: (e, it, el) => {
+      if (e.button !== 0 || e.target.closest('.rp-port')) return;
+      drag = { it, el, x: e.clientX, y: e.clientY, top: R.topOf(it), left: it.x * R.inner };
+      dragged = false;
+    },
+  };
+  const R = rackFrame(rack, items, ctx);
+  const { frame } = R;
+  const wrap = h('div', { class: 'rack-wrap' });
+  const svg = svgEl('svg', { class: 'rack-cables' });
+  const panel = h('div', { class: 'rack-panel card' });
+  wrap.append(frame, svg);
+
+  const drawCables = () => {
+    svg.replaceChildren();
+    if (!RACK.cables) return;
+    const fw = frame.offsetWidth;
+    svg.setAttribute('width', fw + 90);
+    svg.setAttribute('height', frame.offsetHeight + 20);
+    const hot = sel.item ? cablesOf(sel.item, sel.port) : [];
+    const hotChain = sel.port ? chains.get(endKey(byId.get(sel.item), sel.port)) : null;
+    cables.forEach((c, k) => {
+      const a = anchorOf(R.itemEls.get(c.a_item), c.a_port, wrap), b = anchorOf(R.itemEls.get(c.b_item), c.b_port, wrap);
+      if (!a || !b) return;
+      const on = hot.includes(c) || (hotChain && c.kind === 'link' && hotChain.links.includes(c.id));
+      svg.append(svgEl('path', { d: cablePath(a, b, fw + 12 + (k % 10) * 7), class: ['cable', c.kind, on ? 'hot' : sel.item ? 'dim' : ''].filter(Boolean).join(' ') }));
+      for (const p of [a, b]) svg.append(svgEl('circle', { cx: p.x, cy: p.y, r: 2.5, class: 'cable-end' + (on ? ' hot' : '') }));
+    });
+  };
+
+  // ---- drag to move
+  const fits = (it, u, x) => u >= 1 && u + it.u_height <= rack.height_u + 1 + 1e-6 && x >= -1e-6 && x + it.w <= 1 + 1e-6 &&
+    !items.some(o => o.id !== it.id && u < o.u_pos + o.u_height - 1e-6 && o.u_pos < u + it.u_height - 1e-6 && x < o.x + o.w - 1e-6 && o.x < x + it.w - 1e-6);
+  const target = (d, e) => {
+    const top = d.top + (e.clientY - d.y), left = d.left + (e.clientX - d.x);
+    const u = Math.round(rack.height_u + 1 - d.it.u_height - top / RACK_U);
+    const step = d.it.mounted ? 0.25 : 0.05;
+    const x = d.it.w >= 1 ? 0 : Math.max(0, Math.min(1 - d.it.w, Math.round(left / R.inner / step) * step));
+    return { u, x: +x.toFixed(3) };
+  };
+  const onMove = e => {
+    if (!drag) return;
+    if (!dragged && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 4) return;
+    dragged = true;
+    const t = target(drag, e);
+    drag.el.classList.add('dragging');
+    drag.el.classList.toggle('bad', !fits(drag.it, t.u, t.x));
+    drag.el.style.top = `${(rack.height_u + 1 - t.u - drag.it.u_height) * RACK_U + 1}px`;
+    drag.el.style.left = `${RACK_RAIL + t.x * R.inner}px`;
+    svg.replaceChildren();
+  };
+  const onUp = async e => {
+    if (!drag) return;
+    const d = drag; drag = null;
+    if (!dragged) { select(d.it.id, null); return; }
+    setTimeout(() => { dragged = false; }, 0);
+    const t = target(d, e);
+    if ((t.u === d.it.u_pos && t.x === d.it.x) || !fits(d.it, t.u, t.x)) { R.redraw(); drawCables(); return; }
+    try { await api('PUT', `/api/rack-items/${d.it.id}`, { u_pos: t.u, x: t.x }); RACK.sel = { item: d.it.id, port: null }; reload(); }
+    catch (err) { toast(err.message, true); R.redraw(); drawCables(); }
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+  // The listeners are on window, so drop them when the page changes
+  window.addEventListener('hashchange', () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); }, { once: true });
+
+  // ---- side panel
+  const select = (itemId, port) => {
+    sel.item = itemId; sel.port = port;
+    RACK.sel = itemId ? { item: itemId, port } : null;
+    R.redraw(); drawCables(); drawPanel();
+  };
+  const section_ = (title, ...kids) => [h('div', { class: 'k small muted', style: 'margin:14px 0 6px' }, title), ...kids];
+  const drawPanel = () => {
+    const it = sel.item && byId.get(sel.item);
+    if (!it) {
+      const used = items.reduce((s, i) => s + i.u_height * i.w, 0);
+      setKids(panel, h('div', { class: 'card-body' },
+        h('h3', { style: 'margin-bottom:8px' }, rack.name),
+        propsList([['Size', `${rack.width}″ · ${rack.height_u}U`], ['Free', `${fmtU(rack.height_u - used)}U`], ['Location', rack.location], ['Items', String(items.length)]]),
+        rack.notes ? h('p', { class: 'small' }, rack.notes) : null,
+        h('p', { class: 'faint small' }, 'Drag things to move them. Click a port to see where its cable goes and to connect it. Lit ports are up; a dot means something is plugged in or labelled. Yellow cables come from the network map, blue ones from your cabling.'),
+        h('div', { class: 'actions' }, h('button', { class: 'small', onclick: () => rackModal(rack, reload) }, icon('edit'), 'Edit rack'),
+          h('a', { class: 'btn small', href: '#/cabling' }, icon('link'), 'All cabling'))));
+      return;
+    }
+    const close = iconButton('x', 'Close', () => select(null, null));
+    if (sel.port) return drawPort(it, sel.port, close);
+    const nCabled = it.port_list.filter(p => chains.has(endKey(it, p.name))).length;
+    setKids(panel, h('div', { class: 'card-body' },
+      h('div', { class: 'panel-head' }, h('div', { class: 'ent' }, it.kind === 'asset' ? typeIcon(it.asset_type, 'sm') : null, h('h3', null, rackName(it))), close),
+      propsList([['Position', `${uRange(it)}${it.w < 1 ? ` · ${it.w === 0.5 ? 'half' : Math.round(it.w * 100) + '%'} width` : ''}`],
+        ['Height', `${fmtU(it.u_height)}U${it.mounted ? '' : ` (${fmtU(it.u_height * U_IN)}″, not rack-mounted)`}`],
+        ['Type', it.kind === 'asset' ? it.asset_type : kindLabel(it.kind)],
+        ['Model', makerModel(it)], ['Address', it.address],
+        ['Ports', it.port_list.length ? `${it.port_list.length}${it.snmp ? `, ${it.port_list.filter(p => p.oper === 'up').length} up` : ''}${nCabled ? `, ${nCabled} cabled` : ''}` : '']]),
+      it.notes ? h('p', { class: 'small' }, it.notes) : null,
+      h('div', { class: 'actions', style: 'margin-top:12px' },
+        isPanel(it) ? h('button', { class: 'small primary', onclick: () => patchEditor(it.id, reload) }, icon('link'), 'Edit patching') : null,
+        it.asset_id ? h('a', { class: 'btn small', href: `#/assets/${it.asset_id}` }, 'Open') : null,
+        h('button', { class: 'small', onclick: () => rackItemModal(data, it, reload) }, icon('edit'), 'Edit'),
+        !it.port_list.length ? h('button', { class: 'small', onclick: () => connectModal(it, '', reload) }, icon('link'), 'Connect') : null)));
+  };
+  const drawPort = (it, port, close) => {
+    const p = it.port_list.find(x => x.name === port) || { name: port, devices: [], unknown: 0 };
+    const labels = { ...(it.port_labels || {}) };
+    const chain = chains.get(endKey(it, port));
+    const saveLabel = async v => {
+      if ((labels[port] || '') === v) return;
+      labels[port] = v;
+      try { await api('PUT', `/api/rack-items/${it.id}`, { port_labels: labels }); it.port_labels = { ...labels }; toast('Label saved'); R.redraw(); drawCables(); }
+      catch (e) { toast(e.message, true); }
+    };
+    const mapCable = cablesOf(it.id, port).find(c => c.kind === 'map');
+    setKids(panel, h('div', { class: 'card-body' },
+      h('div', { class: 'panel-head' }, h('h3', null, `${rackName(it)} · ${port}`), close),
+      it.snmp ? h('div', { style: 'margin-bottom:10px' }, portStatusPill(p), p.vlan ? h('span', { class: 'pill plain', style: 'margin-left:6px' }, `VLAN ${p.vlan}`) : null) : null,
+      field('Label', h('input', { value: labels[port] || '', placeholder: isPanel(it) ? 'e.g. Office wall jack 2' : 'e.g. Uplink', onchange: e => saveLabel(e.target.value.trim()) })),
+      section_('Cable path', chainView(chain, { onPanel: pid => patchEditor(pid, reload) })),
+      mapCable && !chain ? h('p', { class: 'faint small' }, `The network map has this port going to ${rackName(byId.get(mapCable.a_item === it.id ? mapCable.b_item : mapCable.a_item))} (${MAP_SOURCES[mapCable.source] || mapCable.source}).`) : null,
+      p.devices.length || p.unknown ? section_('Seen on this port',
+        h('div', { class: 'devs' }, p.devices.map(d => h('a', { class: 'dev', href: `#/assets/${d.id}` }, d.name)),
+          p.unknown ? h('span', { class: 'faint small' }, `${p.devices.length ? '+' : ''}${p.unknown} unknown`) : null)) : null,
+      h('div', { class: 'actions', style: 'margin-top:12px' },
+        h('button', { class: 'small', onclick: () => connectModal(it, port, reload) }, icon('link'), chain ? 'Reconnect' : 'Connect'),
+        isPanel(it) ? h('button', { class: 'small', onclick: () => patchEditor(it.id, reload) }, 'Edit patching') : null,
+        chain ? h('button', { class: 'small danger', onclick: async () => {
+          const at = linksAt(data.all_links, it, port);
+          for (const l of at) await api('DELETE', `/api/links/${l.id}`);
+          toast('Unplugged'); reload();
+        } }, 'Unplug') : null)));
+  };
+
+  R.redraw();
+  drawPanel();
+  requestAnimationFrame(drawCables);
+  const cablesToggle = h('label', { class: 'check small' }, h('input', { type: 'checkbox', checked: RACK.cables, onchange: e => { RACK.cables = e.target.checked; drawCables(); } }), 'Show cables');
+  return [
+    h('div', { class: 'page-head' },
+      h('div', null, h('h1', null, rack.name), h('div', { class: 'sub' }, `${rack.width}″ rack · ${rack.height_u}U${rack.location ? ` · ${rack.location}` : ''}`)),
+      h('div', { class: 'actions' }, cablesToggle,
+        h('button', { onclick: () => rackModal(rack, reload) }, icon('edit'), 'Edit rack'),
+        h('button', { class: 'primary', onclick: () => rackItemModal(data, null, reload) }, icon('plus'), 'Add to rack'))),
+    h('div', { class: 'rack-layout' }, h('div', { class: 'card rack-scroll', onclick: e => { if (!dragged && !e.target.closest('.rack-item')) select(null, null); } }, wrap), panel),
+  ];
+}
+
+/** Every rack, wall plate and loose device as blocks you can drag around, with the cables between them, and every path as a list. */
+async function cablingView() {
+  setCrumbs(['Racks', '#/racks'], ['Cabling']);
+  const cab = await api('GET', '/api/cabling');
+  const reload = () => route();
+  const chains = chainIndex(cab.chains);
+  // Without a saved layout, the rack with the most cabling goes first
+  const cabled = r => r.items.reduce((n, i) => n + i.port_list.filter(p => chains.has(endKey(i, p.name))).length, 0);
+  cab.racks.sort((a, b) => cabled(b) - cabled(a) || a.rack.name.localeCompare(b.rack.name));
+  const all = new Map();
+  for (const r of cab.racks) for (const i of r.items) all.set(i.id, { ...i, where: r.rack.name });
+  for (const p of cab.plates) all.set(p.id, { ...p, where: p.location });
+  const racked = new Map([...all.values()].filter(i => i.asset_id).map(i => [i.asset_id, i]));
+  const layout = { ...cab.layout };
+  let selKey = CAB.sel, selItem = null, selBlock = null;
+
+  const canvas = h('div', { class: 'cab-canvas' });
+  const inner = h('div', { class: 'cab-inner' });
+  const svg = svgEl('svg', { class: 'cab-cables' });
+  // Cables inside one rack (switch to patch panel front) go on top, or the rack would hide them
+  const svgFront = svgEl('svg', { class: 'cab-cables front' });
+  canvas.append(inner);
+  const panel = h('div', { class: 'rack-panel card' });
+  let dragged = false;
+  const ctx = {
+    isSel: (it, p) => selKey === endKey(it, p.name),
+    itemSel: it => selItem === it.id,
+    busy: (it, p) => chains.has(endKey(it, p.name)) || (it.port_labels || {})[p.name],
+    dragged: () => dragged,
+    onPort: (it, p) => { selKey = endKey(it, p.name); selItem = selBlock = null; CAB.sel = selKey; draw(); },
+    onItem: it => { selItem = it.id; selKey = selBlock = null; CAB.sel = null; draw(); },
+  };
+  // Rack titles and devices select rather than navigate, so dragging them never opens a page
+  const pickBlock = key => () => { if (dragged) return; selBlock = key; selKey = selItem = null; CAB.sel = null; draw(); };
+
+  // Devices at the end of a cable that aren't in any rack (PCs, the dock...) get a block of their own
+  const loose = [...new Set(cab.links.flatMap(l => ['a', 'b'].map(e => l[`${e}_asset`]).filter(a => a && !racked.has(a))))]
+    .map(id => cab.devices.find(d => d.id === id)).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
+  const els = new Map(), devEls = new Map(), blocks = new Map();
+  const block = (key, el) => { el.classList.add('cab-block'); el.dataset.key = key; blocks.set(key, el); return el; };
+  const draw = () => {
+    inner.replaceChildren(svg);
+    els.clear(); devEls.clear(); blocks.clear();
+    const rackCols = cab.racks.map(r => {
+      const R = rackFrame(r.rack, r.items, ctx);
+      for (const [id, el] of R.itemEls) els.set(id, el);
+      return block(`r:${r.rack.id}`, h('div', { class: 'cab-rack' + (selBlock === `r:${r.rack.id}` ? ' sel' : '') }, h('div', { class: 'cab-title', onclick: pickBlock(`r:${r.rack.id}`) }, r.rack.name,
+        h('span', { class: 'faint' }, ` · ${r.rack.width}″ ${r.rack.height_u}U`)), R.frame));
+    });
+    const plates = [...cab.plates].sort((a, b) => (a.location || '').localeCompare(b.location || '') || a.label.localeCompare(b.label))
+      .map(p => { const el = block(`i:${p.id}`, plateEl(all.get(p.id), ctx)); els.set(p.id, el); return el; });
+    const devs = loose.map(d => {
+      const el = block(`a:${d.id}`, h('div', { class: 'cab-dev' + (selBlock === `a:${d.id}` ? ' sel' : ''), onclick: pickBlock(`a:${d.id}`) }, typeIcon(d.asset_type, 'sm'), d.name));
+      devEls.set(d.id, el);
+      return el;
+    });
+    // First lay things out in columns to find a spot for anything that hasn't been placed, then free them all
+    const cols = [rackCols.shift(), h('div', { class: 'cab-col' }, plates), h('div', { class: 'cab-col' }, devs), ...rackCols].filter(Boolean);
+    const flow = h('div', { class: 'cab-flow' }, cols);
+    inner.append(flow);
+    const spots = new Map([...blocks].map(([key, el]) => [key, [el.offsetLeft, el.offsetTop]]));
+    for (const [key, el] of blocks) {
+      const [x, y] = layout[key] || spots.get(key);
+      layout[key] = [x, y];
+      el.style.left = `${x}px`; el.style.top = `${y}px`;
+      inner.append(el);
+    }
+    flow.remove();
+    inner.append(svgFront);
+    size();
+    requestAnimationFrame(drawCables);
+    drawPanel();
+  };
+  const size = () => {
+    let w = 0, ht = 0;
+    for (const el of blocks.values()) { w = Math.max(w, el.offsetLeft + el.offsetWidth); ht = Math.max(ht, el.offsetTop + el.offsetHeight); }
+    inner.style.width = `${w + 200}px`; inner.style.height = `${ht + 200}px`;
+    for (const v of [svg, svgFront]) { v.setAttribute('width', w + 200); v.setAttribute('height', ht + 200); }
+  };
+  const endEl = (l, e) => {
+    if (l[`${e}_asset`]) { const it = racked.get(l[`${e}_asset`]); return it ? [els.get(it.id), l[`${e}_port`]] : [devEls.get(l[`${e}_asset`]), '']; }
+    return [els.get(l[`${e}_item`]), l[`${e}_port`]];
+  };
+  const drawCables = () => {
+    const k = view.k;
+    svg.replaceChildren();
+    svgFront.replaceChildren();
+    const hot = new Set(selKey && chains.get(selKey) ? chains.get(selKey).links : []);
+    for (const l of cab.links) {
+      const [ae, ap] = endEl(l, 'a'), [be, bp] = endEl(l, 'b');
+      if (!ae || !be) continue;
+      const ab = ae.closest('.cab-block'), bb = be.closest('.cab-block');
+      const ca = centreOf(ae, ap, inner, k), cb = centreOf(be, bp, inner, k);
+      // Within one rack, loop out past its right side; otherwise each end leaves on the side facing the other
+      const gutter = ab === bb ? (ab.offsetLeft + ab.offsetWidth + 30) : null;
+      const a = anchorOf(ae, ap, inner, k, gutter ?? cb.x), b = anchorOf(be, bp, inner, k, gutter ?? ca.x);
+      if (gutter != null && !CAB.front) continue;
+      (gutter != null ? svgFront : svg).append(svgEl('path', { d: cablePath(a, b, gutter), class: ['cable', 'link', hot.has(l.id) ? 'hot' : hot.size ? 'dim' : ''].filter(Boolean).join(' ') }));
+    }
+  };
+  const drawPanel = () => {
+    const c = selKey && chains.get(selKey);
+    if (selKey) {
+      const [kind, id, ...rest] = selKey.split(':');
+      const port = rest.join(':');
+      const it = kind === 'i' ? all.get(Number(id)) : racked.get(Number(id));
+      setKids(panel, h('div', { class: 'card-body' },
+        h('div', { class: 'panel-head' }, h('h3', null, `${it ? rackName(it) : '?'} · ${port}`), iconButton('x', 'Close', () => { selKey = null; CAB.sel = null; draw(); })),
+        it && it.where ? h('div', { class: 'faint small', style: 'margin-bottom:8px' }, it.where) : null,
+        chainView(c, { onPanel: pid => patchEditor(pid, reload) }),
+        h('div', { class: 'actions', style: 'margin-top:12px' },
+          it ? h('button', { class: 'small', onclick: () => connectModal(it, port, reload) }, icon('link'), c ? 'Reconnect' : 'Connect') : null,
+          it && isPanel(it) ? h('button', { class: 'small', onclick: () => patchEditor(it.id, reload) }, 'Edit patching') : null)));
+      return;
+    }
+    if (selBlock) {
+      const [kind, bid] = selBlock.split(':');
+      const close = iconButton('x', 'Close', () => { selBlock = null; draw(); });
+      if (kind === 'r') {
+        const r = cab.racks.find(x => x.rack.id === Number(bid)).rack;
+        setKids(panel, h('div', { class: 'card-body' }, h('div', { class: 'panel-head' }, h('h3', null, r.name), close),
+          propsList([['Size', `${r.width}″ · ${r.height_u}U`], ['Location', r.location]]),
+          h('div', { class: 'actions', style: 'margin-top:12px' }, h('a', { class: 'btn small primary', href: `#/racks/${r.id}` }, 'Open rack'))));
+      } else {
+        const d = cab.devices.find(x => x.id === Number(bid));
+        const paths = cab.chains.filter(c => c.hops.some(hp => hp.kind === 'asset' && hp.id === d.id));
+        setKids(panel, h('div', { class: 'card-body' }, h('div', { class: 'panel-head' }, h('div', { class: 'ent' }, typeIcon(d.asset_type, 'sm'), h('h3', null, d.name)), close),
+          h('div', { class: 'k small muted', style: 'margin:4px 0 6px' }, paths.length === 1 ? 'Cable path' : 'Cable paths'),
+          paths.map(c => h('div', { style: 'margin-bottom:8px' }, chainView(c, { onPanel: pid => patchEditor(pid, reload) }))),
+          h('div', { class: 'actions', style: 'margin-top:12px' }, h('a', { class: 'btn small primary', href: `#/assets/${d.id}` }, 'Open'))));
+      }
+      return;
+    }
+    const it = selItem && all.get(selItem);
+    if (it) {
+      const n = it.port_list.filter(p => chains.has(endKey(it, p.name))).length;
+      setKids(panel, h('div', { class: 'card-body' },
+        h('div', { class: 'panel-head' }, h('h3', null, rackName(it)), iconButton('x', 'Close', () => { selItem = null; draw(); })),
+        propsList([['Where', it.where], ['Type', it.kind === 'asset' ? it.asset_type : kindLabel(it.kind)], ['Ports', it.port_list.length ? `${it.port_list.length}, ${n} cabled` : '']]),
+        h('div', { class: 'actions', style: 'margin-top:12px' },
+          isPanel(it) ? h('button', { class: 'small primary', onclick: () => patchEditor(it.id, reload) }, icon('link'), 'Edit patching') : null,
+          it.kind === 'wall_plate' ? h('button', { class: 'small', onclick: () => plateModal(it, reload) }, icon('edit'), 'Edit') : null,
+          it.rack_id ? h('a', { class: 'btn small', href: `#/racks/${it.rack_id}` }, 'Open rack') : null,
+          it.asset_id ? h('a', { class: 'btn small', href: `#/assets/${it.asset_id}` }, 'Open') : null)));
+      return;
+    }
+    setKids(panel, h('div', { class: 'card-body' },
+      h('h3', { style: 'margin-bottom:8px' }, 'Cabling'),
+      propsList([['Racks', String(cab.racks.length)], ['Wall plates', String(cab.plates.length)], ['Cables', String(cab.links.length)]]),
+      h('p', { class: 'faint small' }, 'Drag racks, wall plates and devices to arrange them; where you put them is saved. Click a port to follow its cable from end to end. A path that ends at an empty wall jack shows what the switch sees on its port.'),
+      h('div', { class: 'actions' }, h('button', { class: 'small', onclick: () => plateModal(null, reload) }, icon('plus'), 'Add wall plate'))));
+  };
+
+  // ---- pan, zoom, and moving blocks
+  const view = CAB.view || { x: 0, y: 0, k: 1 };
+  const apply = () => { inner.style.transform = `translate(${view.x}px,${view.y}px) scale(${view.k})`; CAB.view = { ...view }; };
+  const fit = () => {
+    const cw = canvas.clientWidth, iw = inner.offsetWidth - 200;
+    // Fit the width; a tall rack just scrolls down by dragging
+    view.k = Math.max(0.6, Math.min(1, cw / (iw + 56))) || 1;
+    view.x = Math.max(0, (cw - iw * view.k) / 2); view.y = 0;
+    apply(); drawCables();
+  };
+  const zoom = (f, cx, cy) => {
+    const k = Math.min(2, Math.max(0.15, view.k * f));
+    cx = cx ?? canvas.clientWidth / 2; cy = cy ?? canvas.clientHeight / 2;
+    view.x = cx - (cx - view.x) * (k / view.k); view.y = cy - (cy - view.y) * (k / view.k); view.k = k;
+    apply();
+  };
+  let pan = null, move = null;
+  canvas.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || e.target.closest('.rp-port')) return;
+    dragged = false;
+    const b = e.target.closest('.cab-block');
+    if (b) move = { el: b, x: e.clientX, y: e.clientY, ox: b.offsetLeft, oy: b.offsetTop };
+    else if (!e.target.closest('button, a')) pan = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
+  });
+  const onMove = e => {
+    const d = move || pan;
+    if (!d) return;
+    const dx = e.clientX - d.x, dy = e.clientY - d.y;
+    if (!dragged && Math.hypot(dx, dy) < 4) return;
+    dragged = true;
+    if (move) {
+      const x = Math.max(0, Math.round(move.ox + dx / view.k)), y = Math.max(0, Math.round(move.oy + dy / view.k));
+      move.el.style.left = `${x}px`; move.el.style.top = `${y}px`;
+      move.el.classList.add('moving');
+      layout[move.el.dataset.key] = [x, y];
+      drawCables();
+    } else {
+      canvas.classList.add('dragging');
+      view.x = pan.vx + dx; view.y = pan.vy + dy; apply();
+    }
+  };
+  const onUp = () => {
+    if (move && dragged) {
+      move.el.classList.remove('moving');
+      size();
+      api('PUT', '/api/cabling/layout', { positions: layout }).catch(err => toast(err.message, true));
+    }
+    move = pan = null;
+    canvas.classList.remove('dragging');
+    setTimeout(() => { dragged = false; }, 0);
+  };
+  // A drag that ends over a link or button isn't a click
+  canvas.addEventListener('click', e => { if (dragged) { e.preventDefault(); e.stopPropagation(); } }, true);
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+  window.addEventListener('hashchange', () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp); }, { once: true });
+  canvas.addEventListener('wheel', e => { e.preventDefault(); const r = canvas.getBoundingClientRect(); zoom(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX - r.left, e.clientY - r.top); }, { passive: false });
+  const resetLayout = async () => {
+    await api('PUT', '/api/cabling/layout', { positions: {} });
+    CAB.view = null;
+    reload();
+  };
+
+  // ---- every path, as a list
+  const state = { q: '' };
+  const tbody = h('tbody');
+  const ordered = [...cab.chains].sort((a, b) => a.text.localeCompare(b.text, undefined, { numeric: true }));
+  const drawRows = () => {
+    const q = state.q.toLowerCase();
+    const rows = ordered.filter(c => !q || (c.text + ' ' + (c.end ? c.end.name : '')).toLowerCase().includes(q));
+    setKids(tbody, rows.length ? rows.map(c => h('tr', { class: chains.get(selKey) === c ? 'selected' : '', onclick: e => {
+      if (e.target.closest('a, button')) return;
+      selKey = hopKey(c.hops[0]); selItem = null; CAB.sel = selKey; draw(); drawRows();
+    } }, h('td', null, chainView(c, { onPanel: pid => patchEditor(pid, reload) })))) : h('tr', null, h('td', null, emptyState('link', cab.chains.length ? 'No paths match' : 'No cabling yet', cab.chains.length ? '' : 'Open a patch panel and use Edit patching to say what plugs in where.'))));
+  };
+  drawRows();
+  // Blocks are measured, so lay them out once the page is on screen
+  requestAnimationFrame(() => { draw(); if (CAB.view) { apply(); drawCables(); } else fit(); });
+  return [
+    h('div', { class: 'page-head' },
+      h('div', null, h('h1', null, 'Cabling'), h('div', { class: 'sub' }, `${cab.racks.length} rack${cab.racks.length === 1 ? '' : 's'}, ${cab.plates.length} wall plate${cab.plates.length === 1 ? '' : 's'}, ${cab.links.length} cable${cab.links.length === 1 ? '' : 's'}`)),
+      h('div', { class: 'actions' }, h('button', { onclick: () => plateModal(null, reload) }, icon('plus'), 'Add wall plate'))),
+    h('div', { class: 'rack-layout' },
+      h('section', { class: 'card map-card' },
+        h('div', { class: 'filters' }, h('span', { class: 'muted small' }, 'Drag a rack, plate or device to move it; drag the background to pan; scroll to zoom'), h('span', { class: 'grow' }),
+          h('label', { class: 'check small' }, h('input', { type: 'checkbox', checked: CAB.front, onchange: e => { CAB.front = e.target.checked; drawCables(); } }), 'In-rack patch cords'),
+          h('button', { class: 'small', onclick: resetLayout }, 'Reset layout'),
+          h('div', { class: 'btn-group' }, iconButton('minus', 'Zoom out', () => zoom(1 / 1.25)), iconButton('plus', 'Zoom in', () => zoom(1.25)), h('button', { class: 'small', onclick: fit }, 'Fit'))),
+        canvas),
+      panel),
+    h('section', { class: 'card', style: 'margin-top:18px' },
+      h('div', { class: 'card-head' }, h('h2', null, 'Paths', h('span', { class: 'n' }, cab.chains.length || ''))),
+      h('div', { class: 'filters' }, searchInput('Search paths, devices, ports…', '', e => { state.q = e.target.value; drawRows(); })),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'path-table' }, tbody))),
   ];
 }
 
@@ -2434,6 +3356,9 @@ const ROUTES = [
   [/^#\/assets\/(\d+)$/, 'assets', m => assetView(m[1])],
   [/^#\/keyboards\/(\d+)$/, 'keyboards', m => keyboardView(m[1])],
   [/^#\/map$/, 'map', () => mapView()],
+  [/^#\/racks\/(\d+)$/, 'racks', m => rackView(m[1])],
+  [/^#\/racks$/, 'racks', () => racksView()],
+  [/^#\/cabling$/, 'cabling', () => cablingView()],
   [/^#\/keyboards$/, 'keyboards', () => keyboardsView()],
   [/^#\/inventory\/(\d+)$/, 'inventory', m => itemView(m[1])],
   [/^#\/inventory(?:\?cat=(\w+))?$/, 'inventory', m => inventoryView(m[1])],

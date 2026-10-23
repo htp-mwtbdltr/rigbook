@@ -14,6 +14,8 @@ A self-hosted homelab asset and parts inventory. **Assets** are machines and net
   board takes them out of the on-hand count, and a board can mix several switch kinds and keycap sets.
 - **Every list can be sorted** by clicking a column header. Text sorts A→Z then Z→A, and numbers and sizes sort
   smallest first then largest first.
+- **Racks** show what's mounted where, 19" or 10", with switch ports lit from SNMP and cables drawn from the network
+  map. Patch panels, shelves, monitors, drawers and UPSes can go in too, with labelled, patchable ports.
 - **Categories, fields and asset types** can be edited under Settings. Each category is listed under either
   Inventory (computer parts) or Keyboards.
 
@@ -156,6 +158,52 @@ Rigbook syncs every 5 minutes. Each guest is drawn by name under the asset that 
 or IP), with its VMID, IPs and status; stopped guests are faded. A guest that's also an asset, matched by MAC or name,
 is drawn as that asset under its host. **Add as asset** on a guest makes it one. Templates are skipped.
 
+## Racks
+
+**Racks** in the sidebar holds your racks. Create one with a name, a width (19" or 10") and a height: pick a common
+size or type any height in U.
+
+- **Adding things:** **Add to rack** takes a device from Rigbook or something Rigbook doesn't track: a patch panel
+  (asks how many ports), shelf, blank panel, monitor, keyboard drawer, cable management, power (UPS, PDU) or other.
+  Each has a height in U and a width: full, half (two side by side, like mini PCs on a tray) or quarter. Leave the
+  bottom U blank and it goes in the highest free space.
+- **Assets' height** is the **Rack units (U)** field on the asset, so it's the same wherever it's mounted.
+- **Not rack-mounted:** untick **Rack-mounted** for things that sit in the rack, like a tower UPS on the floor, and
+  give their size in inches. They're drawn to scale with a dashed outline.
+- **Moving:** drag anything to a new U or slot. A move that would overlap something or leave the rack is refused.
+- **Ports:** switches show their SNMP ports, lit when up. Unmanaged switches and patch panels take a port count, and
+  optionally port names (`1, 2, … 8, Uplink 1, Uplink 2`). Click a port to label it, see what's seen on it, follow its
+  cable and connect it.
+- **Cables in a rack:** blue ones are your cabling (below); yellow ones are the network map's links between two
+  assets in the rack that no cable covers yet.
+
+## Cabling
+
+Every cable is stored once, end to end. An end is a device's port (a switch port, a PC; the port can be left blank),
+or one side of a **patch panel** or **wall plate** port. Panels pass a cable through: whatever's on the front of
+port 16 carries on out of the back. So these cables make one path:
+
+    Main Switch gi16 → Patch panel 16 → Wall behind rack 1 → Desk wall plate 1 → MAIN-RIG
+
+- **Wall plates** are panels that aren't in a rack, with a location. Add them on the **Cabling** page. Port names
+  can replace numbers, so a plate can have a coax jack.
+- **Edit patching** on a patch panel or wall plate lists every port with its front, back and where the path ends up.
+  **Fill several** does a run at once: ports 16 to 21, front, go to Main Switch `16,17,18,45,46,23` (or `1-6`, or
+  just `1` to count up from). Cables between two panels land on the far panel's back, patch cords from devices on
+  its front, unless that side is taken.
+- **Connect** on any port does a single cable. Plugging into a port that's in use replaces what was there.
+- **The network map uses it:** a path with a device at both ends sets the downstream device's connection (unless its
+  **Connected to** is set by hand), and the map shows the path. A path that stops at an empty wall jack shows what
+  the switch sees on its first port as the probable far end.
+- **The Cabling page** draws every rack, wall plate and loose device with the cables between them. Drag any of
+  them to arrange the page (positions are saved; **Reset layout** puts them back in columns). Click a port to
+  highlight its path, or a device or rack title for its paths and a link to open it; the list underneath has every
+  path, searchable. **In-rack patch cords** shows or hides cables with both ends in the same rack, such as switch
+  ports to the patch panel front.
+- **Port names** go on the first ports and the count numbers the rest: `Coax` with 6 ports is Coax, 2, 3, 4, 5, 6.
+
+An asset with the type **Modem** goes between the Internet and the firewall on the network map.
+
 ## Import from Snipe-IT (one-time)
 
 ```bash
@@ -181,6 +229,8 @@ Or stop the container and copy `data/rigbook.db`.
     app/snmp.py             SNMP walker and parser (ENTITY, IF, BRIDGE/Q-BRIDGE, LLDP, ARP)
     app/omada.py            Omada controller Open API client and the 5-minute Wi-Fi client sync
     app/proxmox.py          Proxmox VE API client and the 5-minute VM/container sync
+    app/racks.py            Racks API: rack items, fitting and placement, cables from the map
+    app/cabling.py          Cables, wall plates, and tracing paths through patch panels
     app/scripts/            scan.sh, scan-freebsd.sh, scan.ps1 (run on the target machine)
     app/db.py               SQLite schema, migrations, default categories
     app/import_snipeit.py   Snipe-IT importer

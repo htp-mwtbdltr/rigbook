@@ -17,13 +17,15 @@ from fastapi.staticfiles import StaticFiles
 from . import db as store
 from . import omada
 from . import proxmox
+from . import cabling
+from . import racks
 from . import scan as scanner
 from . import snmp
 from .db import db, item_row, log, now
 
 STATIC = Path(__file__).parent / "static"
 APP_PASSWORD = os.environ.get("RIGBOOK_PASSWORD", "")
-ASSET_FIELDS = ["kind", "uplink_port", "name", "asset_type", "status", "location", "hostname", "address", "os", "manufacturer",
+ASSET_FIELDS = ["kind", "uplink_port", "rack_u", "name", "asset_type", "status", "location", "hostname", "address", "os", "manufacturer",
                 "model", "model_number", "serial", "notes", "scan_user", "macs"]
 SNMP_KEYS = ["version", "user", "level", "auth_proto", "priv_proto"]
 SNMP_SECRETS = ["community", "auth_pass", "priv_pass"]
@@ -31,6 +33,8 @@ ITEM_FIELDS = ["category", "name", "manufacturer", "model_number", "spare_qty", 
 
 app = FastAPI(title="Rigbook", docs_url=None, redoc_url=None)
 store.init()
+app.include_router(racks.router)
+app.include_router(cabling.router)
 omada.start()
 proxmox.start()
 
@@ -281,6 +285,11 @@ def build_map(conn):
         "SELECT id, name, asset_type, status, location, hostname, address, os, manufacturer, model, macs, "
         "uplink_id, uplink_port FROM assets WHERE COALESCE(kind, '') != 'keyboard'")]
     assets = {a["id"]: a for a in rows}
+    # Cabling that runs all the way from one asset to another counts as set by hand, unless something already is
+    for child, (parent, port, via) in cabling.patched_uplinks(conn).items():
+        a = assets.get(child)
+        if a and not a["uplink_id"] and parent in assets:
+            a.update(uplink_id=parent, uplink_port=port, patch_via=via)
     _, by_mac, by_name, arp = network_index(conn)
     is_ap = {a["id"] for a in rows if (a["asset_type"] or "").lower() == "access point"}
     ports = []
@@ -345,7 +354,11 @@ def build_map(conn):
         host = by_key.get(nkey(g["node"])) or by_ip.get(node_ip.get(g["node"], ""))
         if host not in assets:
             continue
-        aid = next((by_mac[m] for m in g["macs"] if m in by_mac), None) or by_key.get(nkey(g["name"]))
+        # By name only for assets without MACs: a physical box can share a name with a guest ("debian")
+        aid = next((by_mac[m] for m in g["macs"] if m in by_mac), None)
+        named = by_key.get(nkey(g["name"]))
+        if not aid and named and not mac_list(assets[named]["macs"]):
+            aid = named
         if aid and aid != host:
             asset_guest[aid] = (g, host)
         else:
@@ -398,8 +411,17 @@ def build_map(conn):
             edges.append((a["id"], host, {"port": "", "source": "proxmox", "guest": f"{g['type']} {g['vmid']}"}))
         elif a["uplink_id"] in assets and not roams:
             parent = assets[a["uplink_id"]]
-            edges.append((a["id"], parent["id"], {"port": a["uplink_port"] or "", "source": "manual",
-                                                   "wireless": parent["id"] in is_ap}))
+            edges.append((a["id"], parent["id"], {"port": a["uplink_port"] or "", "wireless": parent["id"] in is_ap,
+                                                   "source": "patch" if "patch_via" in a else "manual",
+                                                   "via": a.get("patch_via", "")}))
+            # An LLDP neighbour is a direct cable, so it still counts: a firewall set as plugged into its modem is
+            # also what the switch sees on its uplink port
+            # (unless an unmanaged switch set by hand owns that port: LLDP can pass through one)
+            if a["id"] in best and best[a["id"]][0][0] == 0 and best[a["id"]][1] != parent["id"] and \
+                    claims.get((best[a["id"]][1], best[a["id"]][2]["name"].lower())) in (None, a["id"]):
+                _, dev, p = best[a["id"]]
+                edges.append((a["id"], dev, {"port": p["name"], "speed": p["speed"], "source": "lldp", "wireless": False,
+                                             "vlan": p["vlan"] or ""}))
         elif a["id"] in best:
             _, dev, p = best[a["id"]]
             link = {"port": p["name"], "speed": p["speed"], "source": "lldp" if best[a["id"]][0][0] == 0 else "omada" if p.get("omada") else "mac",
@@ -459,7 +481,9 @@ def build_map(conn):
 
     def rank(aid):
         t = (assets[aid]["asset_type"] or "").lower()
-        return (0 if t in ("firewall", "router") else 1 if aid in managed else 2, -len(adj.get(aid, [])))
+        # A modem sits between the Internet and the firewall when it's in Rigbook
+        return (-1 if t == "modem" else 0 if t in ("firewall", "router") else 1 if aid in managed else 2,
+                -len(adj.get(aid, [])))
 
     nodes, placed = [], set()
     for root in sorted(adj, key=rank):
@@ -487,7 +511,7 @@ def build_map(conn):
                       "cpus": g["cpus"], "mem": g["mem"], "parent": host,
                       "link": {"port": "", "source": "proxmox", "offline": g["status"] != "running"}})
     roots = [n["id"] for n in nodes if n["type"] == "asset" and n["parent"] is None]
-    internet = next((r for r in roots if (assets[r]["asset_type"] or "").lower() in ("firewall", "router")), None)
+    internet = next((r for r in roots if (assets[r]["asset_type"] or "").lower() in ("modem", "firewall", "router")), None)
     if internet:
         nodes.insert(0, {"id": "internet", "type": "internet", "name": "Internet", "parent": None, "link": None})
         next(n for n in nodes if n["id"] == internet).update(parent="internet", link={"port": "WAN", "source": "auto"})
@@ -495,7 +519,7 @@ def build_map(conn):
                 and (a["status"] or "").lower() not in OFF_MAP_STATUSES]
     for u in unplaced:
         t = (assets[u["id"]]["asset_type"] or "").lower()
-        u["reason"] = ("set where it plugs in" if t in ("switch", "access point", "router", "firewall") and not u["managed"]
+        u["reason"] = ("set where it plugs in" if t in ("switch", "access point", "router", "firewall", "modem") and not u["managed"]
                        else "no MAC addresses recorded" if not mac_list(assets[u["id"]]["macs"]) else "not seen on any scanned switch")
     return {"nodes": nodes, "unplaced": sorted(unplaced, key=lambda u: u["name"].lower()),
             "omada": bool(snap["clients"]), "proxmox": proxmox.config(conn).get("url", "")}
@@ -645,6 +669,13 @@ def save_asset(conn, data, asset_id=None):
         fields["macs"] = ", ".join(mac_list(data["macs"]))
     if fields.get("kind") not in (None, "", "keyboard"):
         raise HTTPException(400, "Unknown asset kind")
+    if "rack_u" in fields:
+        try:
+            fields["rack_u"] = float(fields["rack_u"]) if fields["rack_u"] else None
+        except ValueError:
+            raise HTTPException(400, "Rack units must be a number, like 1 or 2")
+        if fields["rack_u"] is not None and not 0 < fields["rack_u"] <= 60:
+            raise HTTPException(400, "Rack units must be between 0 and 60")
     if "uplink_id" in data:
         fields["uplink_id"] = check_uplink(conn, asset_id, data["uplink_id"])
         if not fields["uplink_id"]:
@@ -831,7 +862,10 @@ def list_assets():
         cats = store.categories(conn)
         assets = [dict(r) for r in conn.execute(
             "SELECT id, name, asset_type, status, location, hostname, address, os, manufacturer, model, serial, last_scan, "
-            "kind, specs FROM assets ORDER BY name COLLATE NOCASE")]
+            "kind, specs, rack_u FROM assets ORDER BY name COLLATE NOCASE")]
+        racked = {r["asset_id"]: {"id": r["id"], "name": r["name"], "u_pos": r["u_pos"]} for r in conn.execute(
+            "SELECT i.asset_id, i.u_pos, r.id, r.name FROM rack_items i JOIN racks r ON r.id = i.rack_id "
+            "WHERE i.asset_id IS NOT NULL")}
         ports = {r["asset_id"]: {"total": r["total"], "up": r["up"]} for r in conn.execute(
             "SELECT asset_id, SUM(kind = 'ethernet') AS total, SUM(kind = 'ethernet' AND oper = 'up') AS up "
             "FROM ports GROUP BY asset_id")}
@@ -844,6 +878,7 @@ def list_assets():
             a["kind"] = a["kind"] or ""
             a["specs"] = json.loads(a["specs"] or "{}")
             a["ports"] = ports.get(a["id"])
+            a["rack"] = racked.get(a["id"])
         return assets
 
 
@@ -868,6 +903,9 @@ def get_asset(asset_id: int):
         asset["snmp"] = {k: profile.get(k) or "" for k in SNMP_KEYS} if profile else None
         asset["snmp_saved"] = bool(profile and profile.get("remember"))
         asset["ports"] = ports_with_links(conn, asset_id)
+        spot = conn.execute("SELECT r.id, r.name, i.u_pos FROM rack_items i JOIN racks r ON r.id = i.rack_id "
+                            "WHERE i.asset_id = ?", (asset_id,)).fetchone()
+        asset["rack"] = dict(spot) if spot else None
         asset["links"] = asset_links(conn, asset)
         asset["components"] = asset_components(conn, asset_id)
         asset["summary"] = summarize(asset["components"], store.categories(conn))

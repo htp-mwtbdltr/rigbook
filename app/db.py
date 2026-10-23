@@ -91,8 +91,49 @@ CREATE TABLE IF NOT EXISTS ports (
     updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS ports_asset ON ports(asset_id);
-CREATE INDEX IF NOT EXISTS events_asset ON events(asset_id);
-CREATE INDEX IF NOT EXISTS events_item ON events(item_id);
+CREATE TABLE IF NOT EXISTS racks (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    width      INTEGER NOT NULL DEFAULT 19,
+    height_u   INTEGER NOT NULL DEFAULT 42,
+    location   TEXT NOT NULL DEFAULT '',
+    notes      TEXT NOT NULL DEFAULT '',
+    created_at TEXT
+);
+-- What's in a rack: an asset, or something Rigbook doesn't track (patch panel, shelf, monitor, UPS...).
+-- u_pos is the bottom U; x and w are the horizontal slot as fractions of the rack's width.
+-- An asset's height is its rack_u, so it's the same in every rack. Wall plates have no rack, just a location.
+CREATE TABLE IF NOT EXISTS rack_items (
+    id          INTEGER PRIMARY KEY,
+    rack_id     INTEGER REFERENCES racks(id) ON DELETE CASCADE,
+    asset_id    INTEGER REFERENCES assets(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL DEFAULT 'other',
+    label       TEXT NOT NULL DEFAULT '',
+    location    TEXT NOT NULL DEFAULT '',
+    u_pos       REAL NOT NULL DEFAULT 0,
+    u_height    REAL NOT NULL DEFAULT 1,
+    x           REAL NOT NULL DEFAULT 0,
+    w           REAL NOT NULL DEFAULT 1,
+    mounted     INTEGER NOT NULL DEFAULT 1,
+    ports       INTEGER NOT NULL DEFAULT 0,
+    port_names  TEXT NOT NULL DEFAULT '',
+    port_labels TEXT NOT NULL DEFAULT '{}',
+    notes       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS rack_items_rack ON rack_items(rack_id);
+-- Cables. Each end is an asset's port, or one side (front/back) of a patch panel or wall plate port.
+CREATE TABLE IF NOT EXISTS patch_links (
+    id      INTEGER PRIMARY KEY,
+    a_item  INTEGER REFERENCES rack_items(id) ON DELETE CASCADE,
+    a_asset INTEGER REFERENCES assets(id) ON DELETE CASCADE,
+    a_port  TEXT NOT NULL DEFAULT '',
+    a_side  TEXT NOT NULL DEFAULT '',
+    b_item  INTEGER REFERENCES rack_items(id) ON DELETE CASCADE,
+    b_asset INTEGER REFERENCES assets(id) ON DELETE CASCADE,
+    b_port  TEXT NOT NULL DEFAULT '',
+    b_side  TEXT NOT NULL DEFAULT '',
+    label   TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -197,11 +238,11 @@ KEYBOARD_LAYOUTS = ["40%", "60%", "65%", "75%", "TKL (80%)", "96%", "Full size (
 KEYBOARD_CONNECTIONS = ["Wired", "2.4GHz", "Bluetooth"]
 
 DEFAULT_STATUSES = ["In use", "Spare", "Wiped", "For sale", "Broken", "Retired"]
-NETWORK_TYPES = ["Switch", "Access point", "Router", "Firewall"]
+NETWORK_TYPES = ["Switch", "Access point", "Router", "Firewall", "Modem"]
 DEFAULT_ASSET_TYPES = ["Desktop", "SFF PC", "Mini PC", "Custom PC", "Laptop", "Server", *NETWORK_TYPES, "Other"]
 # Columns added after the first release: (name, type)
 ASSET_COLUMNS = [("macs", "TEXT"), ("snmp", "TEXT"), ("arp", "TEXT"), ("kind", "TEXT"), ("specs", "TEXT"),
-                 ("uplink_id", "INTEGER"), ("uplink_port", "TEXT")]
+                 ("uplink_id", "INTEGER"), ("uplink_port", "TEXT"), ("rack_u", "REAL")]
 
 
 def now():
@@ -245,6 +286,7 @@ def init():
         }
         for key, value in defaults.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, json.dumps(value)))
+        _upgrade_rack_items(conn)
         have = {r["name"] for r in conn.execute("PRAGMA table_info(assets)")}
         for name, kind in ASSET_COLUMNS:
             if name not in have:
@@ -257,6 +299,12 @@ def init():
                 at = types.index("Other") if "Other" in types else len(types)
                 set_setting(conn, "asset_types", types[:at] + missing + types[at:])
             set_setting(conn, "network_types_added", True)
+        if get_setting(conn, "modem_type_added") is None:
+            types = get_setting(conn, "asset_types")
+            if "Modem" not in types:
+                at = types.index("Other") if "Other" in types else len(types)
+                set_setting(conn, "asset_types", types[:at] + ["Modem"] + types[at:])
+            set_setting(conn, "modem_type_added", True)
         # Keyboard part categories, once, for databases created before them
         if get_setting(conn, "keyboard_categories_added") is None:
             cats = get_setting(conn, "categories")
@@ -275,6 +323,36 @@ def init():
         if get_setting(conn, "keycaps_profile_link_added") is None:
             _add_keycap_profile_and_link(conn)
             set_setting(conn, "keycaps_profile_link_added", True)
+
+
+def _upgrade_rack_items(conn):
+    """The first racks release kept rack items in a rack (rack_id NOT NULL) and cables in rack_links. Wall plates
+    need items without a rack, so rebuild the table, and move any rack_links into patch_links."""
+    cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(rack_items)")}
+    if cols["rack_id"]["notnull"]:
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            ddl = SCHEMA[SCHEMA.index("CREATE TABLE IF NOT EXISTS rack_items"):]
+            ddl = ddl[:ddl.index(");") + 2].replace("IF NOT EXISTS rack_items", "rack_items_new")
+            conn.execute(ddl)
+            keep = ", ".join(c for c in cols if c in {r["name"] for r in conn.execute("PRAGMA table_info(rack_items_new)")})
+            conn.execute(f"INSERT INTO rack_items_new ({keep}) SELECT {keep} FROM rack_items")
+            conn.execute("DROP TABLE rack_items")
+            conn.execute("ALTER TABLE rack_items_new RENAME TO rack_items")
+            conn.execute("CREATE INDEX IF NOT EXISTS rack_items_rack ON rack_items(rack_id)")
+            conn.commit()
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rack_links'").fetchone():
+        assets = {r["id"]: r["asset_id"] for r in conn.execute("SELECT id, asset_id FROM rack_items")}
+        for r in conn.execute("SELECT * FROM rack_links").fetchall():
+            a_asset, b_asset = assets.get(r["a_item"]), r["b_asset"] or assets.get(r["b_item"])
+            conn.execute("INSERT INTO patch_links (a_item, a_asset, a_port, a_side, b_item, b_asset, b_port, b_side, label) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (None if a_asset else r["a_item"], a_asset, r["a_port"], "" if a_asset else "front",
+                          None if b_asset else r["b_item"], b_asset, r["b_port"], "" if b_asset else "front", r["label"]))
+        conn.execute("DROP TABLE rack_links")
 
 
 def _add_keycap_profile_and_link(conn):
