@@ -503,6 +503,8 @@ a.ext-link { white-space: nowrap; }
 .map-edges .edge { fill: none; stroke: var(--border-strong); stroke-width: 1.6; }
 .map-edges .edge.wireless { stroke-dasharray: 5 4; }
 .map-edges .edge.inferred { stroke-dasharray: 1.5 3.5; stroke-linecap: round; }
+.map-edges .edge.offline { opacity: .4; }
+.map-node.offline { opacity: .55; }
 .map-edges .edge.hot { stroke: var(--accent); stroke-width: 2.2; }
 .map-edges .edge-label { font-size: 10.5px; fill: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .map-edges .edge-label.hot { fill: var(--accent); font-weight: 600; }

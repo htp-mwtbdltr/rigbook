@@ -5,7 +5,9 @@ import os
 import re
 import secrets
 import threading
+import socket
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 from fastapi import Body, FastAPI, HTTPException, Request
@@ -13,6 +15,8 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Res
 from fastapi.staticfiles import StaticFiles
 
 from . import db as store
+from . import omada
+from . import proxmox
 from . import scan as scanner
 from . import snmp
 from .db import db, item_row, log, now
@@ -27,6 +31,8 @@ ITEM_FIELDS = ["category", "name", "manufacturer", "model_number", "spare_qty", 
 
 app = FastAPI(title="Rigbook", docs_url=None, redoc_url=None)
 store.init()
+omada.start()
+proxmox.start()
 
 
 @app.middleware("http")
@@ -233,6 +239,36 @@ def asset_links(conn, asset):
 
 OFF_MAP_STATUSES = {"wiped", "retired", "for sale", "broken"}
 
+DNS_CACHE, DNS_PENDING = {}, {}
+DNS_POOL = ThreadPoolExecutor(8)
+
+
+def _ptr(ip):
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+    except OSError:
+        name = ""
+    DNS_CACHE[ip] = (name, time.time())
+    DNS_PENDING.pop(ip, None)
+    return name
+
+
+def reverse_dns(ips, timeout=1.5):
+    """PTR names for these IPs. Lookups still running after the timeout finish in the background for next time."""
+    t = time.time()
+    for ip in ips:
+        hit = DNS_CACHE.get(ip)
+        if ip not in DNS_PENDING and (not hit or t - hit[1] > (3600 if hit[0] else 600)):
+            DNS_PENDING[ip] = DNS_POOL.submit(_ptr, ip)
+    running = [DNS_PENDING[ip] for ip in ips if ip in DNS_PENDING]
+    if running:
+        wait(running, timeout=timeout)
+    return {ip: DNS_CACHE[ip][0] for ip in ips if DNS_CACHE.get(ip, ("",))[0]}
+
+
+def short_host(name):
+    return name if re.fullmatch(r"[\d.]+", name) else name.split(".")[0]
+
 
 def build_map(conn):
     """The network as a tree: who plugs into what, from switch MAC tables and LLDP plus connections set by hand.
@@ -255,8 +291,67 @@ def build_map(conn):
         # An AP's ethernet port is its uplink: everything upstream is learned there, which says nothing
         if p["kind"] == "wifi" or (p["kind"] == "ethernet" and r["asset_id"] not in is_ap):
             ports.append(p)
+
+    # Wi-Fi clients from the Omada controller, as one wireless "port" per AP and SSID
+    snap = omada.snapshot(conn)
+    by_ip = {a["address"]: a["id"] for a in rows if a["address"]}
+    ap_asset = {d["mac"]: by_mac.get(d["mac"]) or by_ip.get(d["ip"]) or by_name.get(d["name"].lower())
+                for d in snap["devices"]}
+    # Clients that dropped off are only kept for known devices. The switches see every Wi-Fi client on the APs'
+    # uplink port, so an AP sighting, even an old one, says more than a switch port does
+    wifi_ports, last_seen = {}, {}
+    for c in snap["clients"]:
+        if c["ip"] and not c.get("offline"):
+            arp.setdefault(c["mac"], c["ip"])
+        ap = ap_asset.get(c["ap_mac"]) if c["wireless"] else None
+        offline = bool(c.get("offline"))
+        if ap in assets and not (offline and c["mac"] not in by_mac):
+            wifi_ports.setdefault((ap, c["ssid"] or "Wi-Fi", offline), []).append(c["mac"])
+            last_seen[c["mac"]] = c.get("last_seen", "")
+    for (ap, ssid, offline), macs in wifi_ports.items():
+        ports.append({"asset_id": ap, "name": ssid, "kind": "wifi", "speed": 0, "vlan": "", "neighbor": {},
+                      "learned": macs, "omada": True, "offline": offline})
     managed = {p["asset_id"] for p in ports} | {r[0] for r in conn.execute("SELECT DISTINCT asset_id FROM ports")}
     own_macs = {m for a in rows for m in mac_list(a["macs"])}
+
+    # A MAC no asset has is matched on its name instead (from Omada, else reverse DNS): phones and laptops with
+    # randomized MACs keep their name when the MAC changes
+    def nkey(text):
+        return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+    by_key = {}
+    for a in rows:
+        for n in (a["name"], a["hostname"], (a["hostname"] or "").split(".")[0]):
+            if nkey(n):
+                by_key.setdefault(nkey(n), a["id"])
+    stray = {m for p in ports for m in p["learned"]} - set(by_mac)
+    client_names = {c["mac"]: [(c["name"], "Omada"), (c["hostname"], "Omada")] for c in snap["clients"]}
+    ptr = reverse_dns(sorted({arp[m] for m in stray if arp.get(m)}))
+    matched = {}
+    for m in sorted(stray):
+        dns = ptr.get(arp.get(m), "")
+        for n, src in client_names.get(m, []) + [(short_host(dns), "DNS")]:
+            aid = by_key.get(nkey(n))
+            if aid:
+                by_mac[m] = aid
+                matched.setdefault(aid, {"name": n, "source": src, "mac": m})
+                break
+
+    # Proxmox guests belong under the asset that is their node. A guest that is an asset itself (same MAC or name)
+    # is drawn as that asset; the rest are drawn from Proxmox directly instead of as unknown MACs
+    px = proxmox.snapshot(conn)
+    node_ip = {n["name"]: n["ip"] for n in px["nodes"]}
+    guest_mac, asset_guest, guests = {}, {}, []
+    for g in px["guests"]:
+        host = by_key.get(nkey(g["node"])) or by_ip.get(node_ip.get(g["node"], ""))
+        if host not in assets:
+            continue
+        aid = next((by_mac[m] for m in g["macs"] if m in by_mac), None) or by_key.get(nkey(g["name"]))
+        if aid and aid != host:
+            asset_guest[aid] = (g, host)
+        else:
+            guests.append((g, host))
+        for m in g["macs"]:
+            guest_mac[m] = host
 
     # Best port for every asset and every unknown MAC
     best, unknown_best = {}, {}
@@ -275,7 +370,7 @@ def build_map(conn):
             unknown_best[key] = ((0, 0, n), dev, p, p["neighbor"].get("name") or "")
         for mac in p["learned"]:
             aid = by_mac.get(mac)
-            score = (1, 0 if wifi else 1, n)
+            score = (1, 0 if wifi and not p.get("offline") else 1 if wifi else 2, n)
             if aid:
                 if aid != dev and (aid not in best or score < best[aid][0]):
                     best[aid] = (score, dev, p)
@@ -292,18 +387,25 @@ def build_map(conn):
         return {"id": a["id"], "type": "asset", "name": a["name"], "asset_type": a["asset_type"] or "",
                 "status": a["status"] or "", "location": a["location"] or "", "address": a["address"] or "",
                 "hostname": a["hostname"] or "", "maker_model": " ".join(x for x in (a["manufacturer"], a["model"]) if x),
-                "os": a["os"] or "", "managed": a["id"] in managed}
+                "os": a["os"] or "", "managed": a["id"] in managed, "matched_by": matched.get(a["id"])}
 
     edges = []  # (child, parent, link)
     for a in rows:
-        if a["uplink_id"] in assets:
+        # Wi-Fi roams: where Omada last saw a device beats an access point it was set to by hand
+        roams = a["uplink_id"] in is_ap and a["id"] in best and best[a["id"]][2].get("omada")
+        if a["id"] in asset_guest and not a["uplink_id"]:
+            g, host = asset_guest[a["id"]]
+            edges.append((a["id"], host, {"port": "", "source": "proxmox", "guest": f"{g['type']} {g['vmid']}"}))
+        elif a["uplink_id"] in assets and not roams:
             parent = assets[a["uplink_id"]]
             edges.append((a["id"], parent["id"], {"port": a["uplink_port"] or "", "source": "manual",
                                                    "wireless": parent["id"] in is_ap}))
         elif a["id"] in best:
             _, dev, p = best[a["id"]]
-            link = {"port": p["name"], "speed": p["speed"], "source": "lldp" if best[a["id"]][0][0] == 0 else "mac",
+            link = {"port": p["name"], "speed": p["speed"], "source": "lldp" if best[a["id"]][0][0] == 0 else "omada" if p.get("omada") else "mac",
                     "wireless": p["kind"] == "wifi", "vlan": p["vlan"] or ""}
+            if p.get("offline"):
+                link.update(offline=True, last_seen=max(last_seen.get(m, "") for m in mac_list(a["macs"])))
             owner = claims.get((dev, p["name"].lower()))
             if owner and owner != a["id"]:
                 edges.append((a["id"], owner, dict(link, port="", source="inferred",
@@ -318,6 +420,8 @@ def build_map(conn):
             alone.setdefault((parent, link["port"].lower()), []).append(child)
     groups = {}
     for mac, (score, dev, p, name) in unknown_best.items():
+        if mac in guest_mac:
+            continue
         owner = claims.get((dev, p["name"].lower()))
         hosts = alone.get((dev, p["name"].lower()), [])
         host = hosts[0] if not owner and len(hosts) == 1 and p["kind"] != "wifi" else None
@@ -326,8 +430,22 @@ def build_map(conn):
             "id": f"u:{parent}:{dev}:{p['name']}", "type": "unknown", "devices": [], "on_host": bool(host),
             "seen": f"{assets[dev]['name']} {p['name']}", "parent_link": {
                 "port": "" if owner or host else p["name"], "speed": p["speed"],
-                "source": "inferred" if owner or host else "mac", "wireless": p["kind"] == "wifi"}})
-        g["devices"].append({"mac": "" if mac.startswith("lldp:") else mac, "ip": arp.get(mac, ""), "name": name})
+                "source": "inferred" if owner or host else "omada" if p.get("omada") else "mac",
+                "wireless": p["kind"] == "wifi"}})
+        g["devices"].append({"mac": "" if mac.startswith("lldp:") else mac, "ip": arp.get(mac, ""), "name": name,
+                             "source": "LLDP" if name else ""})
+
+    # Names for unknown devices: what the Omada controller calls them, else reverse DNS
+    oname = {c["mac"]: c["name"] or c["hostname"] for c in snap["clients"] if c["name"] or c["hostname"]}
+    oname.update({d["mac"]: f"{d['name'] or d['model']} (Omada {d['type'] or 'device'})" for d in snap["devices"]})
+    unnamed = [d for g in groups.values() for d in g["devices"] if not d["name"]]
+    for d in unnamed:
+        if d["mac"] in oname:
+            d["name"], d["source"] = oname[d["mac"]], "Omada"
+    ptr = reverse_dns(sorted({d["ip"] for d in unnamed if not d["name"] and d["ip"]}))
+    for d in unnamed:
+        if not d["name"] and d["ip"] in ptr:
+            d["name"], d["source"], d["dns"] = short_host(ptr[d["ip"]]), "DNS", ptr[d["ip"]]
 
     # Undirected graph, then a tree from the firewall (or the busiest switch) outwards
     adj = {}
@@ -336,6 +454,8 @@ def build_map(conn):
         adj.setdefault(parent, []).append((child, link))
     for (parent, _, _), g in groups.items():
         adj.setdefault(parent, [])
+    for _, host in guests:
+        adj.setdefault(host, [])
 
     def rank(aid):
         t = (assets[aid]["asset_type"] or "").lower()
@@ -360,6 +480,12 @@ def build_map(conn):
         g["parent"], g["link"] = parent, g.pop("parent_link")
         g["devices"].sort(key=lambda d: (not d["ip"], d["name"] == "", d["mac"]))
         nodes.append(g)
+    for g, host in guests:
+        nodes.append({"id": f"vm:{g['node']}:{g['vmid']}", "type": "guest", "name": g["name"], "guest_type": g["type"],
+                      "vmid": g["vmid"], "status": g["status"], "node": g["node"], "macs": g["macs"],
+                      "ips": g["ips"] or [arp[m] for m in g["macs"] if m in arp], "tags": g["tags"],
+                      "cpus": g["cpus"], "mem": g["mem"], "parent": host,
+                      "link": {"port": "", "source": "proxmox", "offline": g["status"] != "running"}})
     roots = [n["id"] for n in nodes if n["type"] == "asset" and n["parent"] is None]
     internet = next((r for r in roots if (assets[r]["asset_type"] or "").lower() in ("firewall", "router")), None)
     if internet:
@@ -371,7 +497,8 @@ def build_map(conn):
         t = (assets[u["id"]]["asset_type"] or "").lower()
         u["reason"] = ("set where it plugs in" if t in ("switch", "access point", "router", "firewall") and not u["managed"]
                        else "no MAC addresses recorded" if not mac_list(assets[u["id"]]["macs"]) else "not seen on any scanned switch")
-    return {"nodes": nodes, "unplaced": sorted(unplaced, key=lambda u: u["name"].lower())}
+    return {"nodes": nodes, "unplaced": sorted(unplaced, key=lambda u: u["name"].lower()),
+            "omada": bool(snap["clients"]), "proxmox": proxmox.config(conn).get("url", "")}
 
 
 def replace_ports(conn, asset_id, ports):
@@ -600,6 +727,100 @@ def save_settings(data: dict = Body(...)):
             if key in data:
                 store.set_setting(conn, key, [s.strip() for s in data[key] if s.strip()])
     return meta()
+
+
+def omada_info(conn):
+    cfg = omada.config(conn)
+    return {"url": cfg.get("url", ""), "client_id": cfg.get("client_id", ""), "has_secret": bool(cfg.get("client_secret")),
+            "status": store.get_setting(conn, "omada_status") or {}}
+
+
+@app.get("/api/omada")
+def get_omada():
+    with db() as conn:
+        return omada_info(conn)
+
+
+@app.put("/api/omada")
+def save_omada(data: dict = Body(...)):
+    """Controller address and Open API credentials. The secret is kept unless a new one is given, and never returned."""
+    with db() as conn:
+        cfg = omada.config(conn)
+        url = clean(data.get("url")) or ""
+        if url and not re.match(r"https?://", url):
+            url = "https://" + url
+        cfg.update(url=url.rstrip("/"), client_id=clean(data.get("client_id")) or "")
+        if clean(data.get("client_secret")):
+            cfg["client_secret"] = clean(data["client_secret"])
+        if not cfg["url"]:
+            cfg = {}
+            store.set_setting(conn, "omada_snapshot", {"devices": [], "clients": []})
+            store.set_setting(conn, "omada_status", {})
+        store.set_setting(conn, "omada", cfg)
+    status = omada.sync() if cfg else None
+    if status and not status["ok"]:
+        raise HTTPException(400, status["error"])
+    with db() as conn:
+        return omada_info(conn)
+
+
+def proxmox_info(conn):
+    cfg = proxmox.config(conn)
+    return {"url": cfg.get("url", ""), "token_id": cfg.get("token_id", ""), "has_secret": bool(cfg.get("secret")),
+            "status": store.get_setting(conn, "proxmox_status") or {}}
+
+
+@app.get("/api/proxmox")
+def get_proxmox():
+    with db() as conn:
+        return proxmox_info(conn)
+
+
+@app.put("/api/proxmox")
+def save_proxmox(data: dict = Body(...)):
+    """Proxmox address and API token. The secret is kept unless a new one is given, and never returned."""
+    with db() as conn:
+        cfg = proxmox.config(conn)
+        url = clean(data.get("url")) or ""
+        if url and not re.match(r"https?://", url):
+            url = "https://" + url
+        if url and not re.search(r":\d+$", url):
+            url += ":8006"
+        cfg.update(url=url.rstrip("/"), token_id=clean(data.get("token_id")) or "")
+        if clean(data.get("secret")):
+            cfg["secret"] = clean(data["secret"])
+        if not cfg["url"]:
+            cfg = {}
+            store.set_setting(conn, "proxmox_snapshot", {"nodes": [], "guests": []})
+            store.set_setting(conn, "proxmox_status", {})
+        store.set_setting(conn, "proxmox", cfg)
+    status = proxmox.sync() if cfg else None
+    if status and not status["ok"]:
+        raise HTTPException(400, status["error"])
+    with db() as conn:
+        return proxmox_info(conn)
+
+
+@app.post("/api/proxmox/sync")
+def sync_proxmox():
+    status = proxmox.sync()
+    if status is None:
+        raise HTTPException(400, "Set up Proxmox first")
+    if not status["ok"]:
+        raise HTTPException(502, status["error"])
+    with db() as conn:
+        return proxmox_info(conn)
+
+
+@app.post("/api/omada/sync")
+def sync_omada():
+    status = omada.sync()
+    if status is None:
+        raise HTTPException(400, "Set up the Omada controller first")
+    if not status["ok"]:
+        raise HTTPException(502, status["error"])
+    with db() as conn:
+        return omada_info(conn)
 
 
 # ---------------------------------------------------------------- assets

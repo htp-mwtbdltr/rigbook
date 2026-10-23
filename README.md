@@ -32,6 +32,8 @@ This folder holds everything needed to rebuild the container. These things were 
 | **Public URL for scan scripts** (optional) | `.env` → `RIGBOOK_URL=` | Empty means the address you opened the UI on. Original: `http://192.168.1.216:8290`. |
 | **Reverse proxy** | Nginx Proxy Manager, not this repo | The original was proxied as `http://inventory.jarvis/` → `192.168.1.216:8290`. Re-create the proxy host if you want that name back. No special settings are needed, because discovery runs as a background job so it can't hit a proxy timeout. |
 | **SNMP credentials** | Entered in the UI per device | These are the community string (v1/v2c) or v3 user/auth/priv passwords. They're stored only if you tick **Remember** (in plaintext in `rigbook.db`) and the API never returns them. The original DB had none saved: the switch, `192.168.1.112`, uses v2c read-only, and the Omada APs use SNMPv3 pushed from the controller. |
+| **Omada Open API credentials** | Entered under Settings → Omada controller | The client ID and secret, stored in plaintext in `rigbook.db`. The API never returns the secret. The original controller is `https://192.168.1.99:8043`. |
+| **Proxmox API token** | Entered under Settings → Proxmox VE | The token ID and secret, stored in plaintext in `rigbook.db`. The API never returns the secret. The original host is `https://192.168.1.88:8006`, token `root@pam!rigbook` with PVEAuditor. |
 | **SSH passwords** | Typed per scan | Never stored. |
 | **Snipe-IT API key** | Command-line argument only | Only needed for the one-time importer (see below). It was never in the code. |
 
@@ -108,9 +110,51 @@ to every machine. It's built from what the switch scans saw:
 - **Taking over a port:** a device set by hand as plugged into a managed switch's port takes over everything else the
   switch sees on that port. For example, an unmanaged switch on `gi18` collects every machine seen on `gi18`.
 - **Wi-Fi links:** a device connected to an access point is drawn with a dashed line.
+- **Matching by name:** a MAC that no asset has is matched to an asset whose name or hostname equals the name Omada or
+  reverse DNS gives it, ignoring case and punctuation (`Billy's S25 Ultra` matches `Billy-s-S25-Ultra`). That keeps
+  phones with randomized MACs placed without recording a MAC at all.
+- **Names for unknown devices:** they're named from the Omada controller when it knows them, otherwise from reverse DNS
+  on their IP (with OPNsense's Unbound registering DHCP leases, that gives names like `homeassistant`).
+
+### Wi-Fi clients from an Omada controller
+
+Omada APs don't list their clients over SNMP, so Rigbook asks the controller instead, through its Open API:
+
+1. In the Omada controller, open **Settings → Platform Integration → Open API** (global settings, not a site's) and
+   choose **Add New App**.
+2. Name it `rigbook`, set **Mode** to **Client Credentials**, and pick a **Role**. **Viewer** is enough, since Rigbook
+   only reads. Give it access to your site (or all sites), then save.
+3. Copy the app's **Client ID** and **Client Secret**.
+4. In Rigbook, go to **Settings → Omada controller** and enter the controller address (the software controller is
+   `https://<ip>:8043`, an OC200/OC300 is `https://<ip>`), the client ID and the secret. **Save and test** logs in
+   and syncs straight away.
+
+Rigbook then syncs every 5 minutes. Each wireless client goes under the AP it's associated with, grouped by SSID, and
+takes the controller's name for it. Wi-Fi devices move with each sync as they roam between APs or networks, and what Omada
+sees beats an access point set by hand. A known device that drops off Wi-Fi stays at the AP and SSID it was last on,
+faded and marked with when it was last seen, for 7 days. The APs have to be assets in Rigbook; they're matched by MAC, IP or name.
 
 Click a device for its details and to change its connection, double-click to open it, drag to pan, and scroll to
 zoom. Machines that are in use but couldn't be placed are listed under the map, with the reason.
+
+### VMs and containers from Proxmox VE
+
+Guests share their host's switch port, so without this they show as a pile of unknown MACs. Rigbook reads every VM
+and container from the Proxmox API, with a read-only token:
+
+1. In Proxmox, go to **Datacenter → Permissions → API Tokens → Add**. Choose user `root@pam`, token ID `rigbook`,
+   leave **Privilege Separation** ticked, and copy the secret it shows (it's only shown once).
+2. Go to **Datacenter → Permissions → Add → API Token Permission**. Set path `/`, token `root@pam!rigbook`, role
+   **PVEAuditor**, and keep **Propagate** ticked.
+3. In Rigbook, go to **Settings → Proxmox VE** and enter `https://<host>:8006`, the token ID `root@pam!rigbook` and
+   the secret.
+
+From the shell, steps 1 and 2 are
+`pveum user token add root@pam rigbook --privsep 1` and `pveum acl modify / --tokens 'root@pam!rigbook' --roles PVEAuditor`.
+
+Rigbook syncs every 5 minutes. Each guest is drawn by name under the asset that is its node (matched by name, hostname
+or IP), with its VMID, IPs and status; stopped guests are faded. A guest that's also an asset, matched by MAC or name,
+is drawn as that asset under its host. **Add as asset** on a guest makes it one. Templates are skipped.
 
 ## Import from Snipe-IT (one-time)
 
@@ -135,6 +179,8 @@ Or stop the container and copy `data/rigbook.db`.
     app/main.py             API (FastAPI), background discovery jobs, port/MAC matching
     app/scan.py             SSH runner and the Linux / FreeBSD / Windows scan parsers
     app/snmp.py             SNMP walker and parser (ENTITY, IF, BRIDGE/Q-BRIDGE, LLDP, ARP)
+    app/omada.py            Omada controller Open API client and the 5-minute Wi-Fi client sync
+    app/proxmox.py          Proxmox VE API client and the 5-minute VM/container sync
     app/scripts/            scan.sh, scan-freebsd.sh, scan.ps1 (run on the target machine)
     app/db.py               SQLite schema, migrations, default categories
     app/import_snipeit.py   Snipe-IT importer
