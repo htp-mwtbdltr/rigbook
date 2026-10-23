@@ -488,3 +488,64 @@ a.dev:hover { background: var(--accent-soft); color: var(--accent); text-decorat
 .link-row .t { font-weight: 600; }
 .link-row .s { color: var(--muted); font-size: 12.5px; }
 a.ext-link { white-space: nowrap; }
+
+/* ---------------------------------------------------------------- network map */
+.map-card { overflow: hidden; }
+.map-wrap { position: relative; border-top: 1px solid var(--border); }
+.map-canvas {
+  position: relative; height: calc(100vh - 250px); min-height: 420px; overflow: hidden; cursor: grab; touch-action: none;
+  background-color: var(--surface-2);
+  background-image: radial-gradient(circle, var(--border) 1px, transparent 1px); background-size: 20px 20px;
+}
+.map-canvas.dragging { cursor: grabbing; }
+.map-inner { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.map-edges { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+.map-edges .edge { fill: none; stroke: var(--border-strong); stroke-width: 1.6; }
+.map-edges .edge.wireless { stroke-dasharray: 5 4; }
+.map-edges .edge.inferred { stroke-dasharray: 1.5 3.5; stroke-linecap: round; }
+.map-edges .edge.hot { stroke: var(--accent); stroke-width: 2.2; }
+.map-edges .edge-label { font-size: 10.5px; fill: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.map-edges .edge-label.hot { fill: var(--accent); font-weight: 600; }
+.map-node {
+  all: unset; box-sizing: border-box; position: absolute; display: flex; align-items: center; gap: 9px; padding: 0 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-sm); cursor: pointer;
+  transition: border-color .12s, box-shadow .12s;
+}
+.map-node:hover { border-color: var(--border-strong); }
+.map-node:focus-visible { box-shadow: 0 0 0 3px var(--accent-ring); }
+.map-node.sel, .map-node.on-path { border-color: var(--accent); }
+.map-node.sel { box-shadow: 0 0 0 3px var(--accent-ring); }
+.map-node .txt { display: flex; flex-direction: column; min-width: 0; }
+.map-node .t { font-weight: 600; font-size: 13px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.map-node .s { font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.map-node.unknown { border-style: dashed; background: var(--surface-2); box-shadow: none; }
+.map-node.unknown .t { font-weight: 500; color: var(--text-2); }
+.map-node.internet { border-radius: 999px; }
+.map-panel {
+  position: absolute; top: 12px; right: 12px; width: 320px; max-height: calc(100% - 24px); overflow: auto;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-lg); padding: 14px 16px;
+}
+.map-panel[hidden] { display: none; }
+.map-panel .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.map-panel h3 { margin: 0; font-size: 15px; }
+.map-panel .props { margin: 0 -16px; }
+.map-panel .panel-link { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 13px; }
+.map-panel .panel-link .k { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+.map-panel .panel-list { display: flex; flex-direction: column; gap: 2px; margin: 0 -6px; }
+.map-panel .panel-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px; border-radius: 8px; }
+.map-panel .panel-row:hover { background: var(--surface-2); }
+.map-legend { display: inline-flex; align-items: center; gap: 6px; }
+.map-legend i { display: inline-block; width: 22px; height: 0; border-top: 2px solid var(--border-strong); margin-left: 8px; }
+.map-legend i.lg-wifi { border-top-style: dashed; }
+.map-legend i.lg-inferred { border-top-style: dotted; }
+.btn-group { display: inline-flex; align-items: center; gap: 2px; }
+.map-unplaced { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 16px; border-top: 1px solid var(--border); }
+.chip-btn { height: 30px; padding: 0 10px 0 4px; font-size: 12.5px; gap: 6px; border-radius: 999px; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+@media (max-width: 720px) {
+  .map-legend { display: none; }
+  .map-canvas { height: calc(100vh - 230px); }
+  .map-panel { top: auto; bottom: 8px; left: 8px; right: 8px; width: auto; max-height: 55%; }
+}
+.map-panel h3 { text-transform: none; letter-spacing: 0; color: var(--text); font-weight: 600; }
+.alert.hint { background: var(--accent-soft); color: var(--text-2); }

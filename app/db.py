@@ -200,7 +200,8 @@ DEFAULT_STATUSES = ["In use", "Spare", "Wiped", "For sale", "Broken", "Retired"]
 NETWORK_TYPES = ["Switch", "Access point", "Router", "Firewall"]
 DEFAULT_ASSET_TYPES = ["Desktop", "SFF PC", "Mini PC", "Custom PC", "Laptop", "Server", *NETWORK_TYPES, "Other"]
 # Columns added after the first release: (name, type)
-ASSET_COLUMNS = [("macs", "TEXT"), ("snmp", "TEXT"), ("arp", "TEXT"), ("kind", "TEXT"), ("specs", "TEXT")]
+ASSET_COLUMNS = [("macs", "TEXT"), ("snmp", "TEXT"), ("arp", "TEXT"), ("kind", "TEXT"), ("specs", "TEXT"),
+                 ("uplink_id", "INTEGER"), ("uplink_port", "TEXT")]
 
 
 def now():

@@ -93,6 +93,25 @@ Because the default route on a firewall is its WAN, the asset's IP is taken from
 
 If the BIOS reports an onboard port as a slot, or doesn't report a card's slot, the review screen shows a warning. You can fix the slot field there before saving.
 
+## Network map
+
+**Network map** in the sidebar draws the network as a tree, from the Internet through the firewall and switches out
+to every machine. It's built from what the switch scans saw:
+
+- **Placing machines:** a machine goes on the most specific switch port its MAC address shows up on, or on the port
+  where LLDP names it.
+- **Unknown devices:** MACs that don't match an asset are grouped per port. Common ones are labelled, such as
+  Proxmox or Hyper-V VMs, Docker, and phones' private MACs, and any of them can be added as a device from the map.
+  Unknown MACs on a port with only one known machine are drawn under that machine, since they're usually its VMs.
+- **What scans can't see:** unmanaged switches, Wi-Fi clients and docks are set by hand. Add the device, then set
+  **Connected to** (and optionally the port) on it, from its edit form, its Network card or the map's side panel.
+- **Taking over a port:** a device set by hand as plugged into a managed switch's port takes over everything else the
+  switch sees on that port. For example, an unmanaged switch on `gi18` collects every machine seen on `gi18`.
+- **Wi-Fi links:** a device connected to an access point is drawn with a dashed line.
+
+Click a device for its details and to change its connection, double-click to open it, drag to pan, and scroll to
+zoom. Machines that are in use but couldn't be placed are listed under the map, with the reason.
+
 ## Import from Snipe-IT (one-time)
 
 ```bash

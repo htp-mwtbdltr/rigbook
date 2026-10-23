@@ -19,7 +19,7 @@ from .db import db, item_row, log, now
 
 STATIC = Path(__file__).parent / "static"
 APP_PASSWORD = os.environ.get("RIGBOOK_PASSWORD", "")
-ASSET_FIELDS = ["kind", "name", "asset_type", "status", "location", "hostname", "address", "os", "manufacturer",
+ASSET_FIELDS = ["kind", "uplink_port", "name", "asset_type", "status", "location", "hostname", "address", "os", "manufacturer",
                 "model", "model_number", "serial", "notes", "scan_user", "macs"]
 SNMP_KEYS = ["version", "user", "level", "auth_proto", "priv_proto"]
 SNMP_SECRETS = ["community", "auth_pass", "priv_pass"]
@@ -231,6 +231,149 @@ def asset_links(conn, asset):
     return links
 
 
+OFF_MAP_STATUSES = {"wiped", "retired", "for sale", "broken"}
+
+
+def build_map(conn):
+    """The network as a tree: who plugs into what, from switch MAC tables and LLDP plus connections set by hand.
+
+    Every MAC is seen on its own port and on every uplink, so each device goes on the most specific port it shows
+    up on. A device set by hand as plugged into switch port X (an unmanaged switch, usually) takes over everything
+    the switch sees on X that hasn't been placed by hand itself.
+    """
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, name, asset_type, status, location, hostname, address, os, manufacturer, model, macs, "
+        "uplink_id, uplink_port FROM assets WHERE COALESCE(kind, '') != 'keyboard'")]
+    assets = {a["id"]: a for a in rows}
+    _, by_mac, by_name, arp = network_index(conn)
+    is_ap = {a["id"] for a in rows if (a["asset_type"] or "").lower() == "access point"}
+    ports = []
+    for r in conn.execute("SELECT * FROM ports ORDER BY asset_id, id"):
+        p = port_row(r)
+        if r["asset_id"] not in assets:
+            continue
+        # An AP's ethernet port is its uplink: everything upstream is learned there, which says nothing
+        if p["kind"] == "wifi" or (p["kind"] == "ethernet" and r["asset_id"] not in is_ap):
+            ports.append(p)
+    managed = {p["asset_id"] for p in ports} | {r[0] for r in conn.execute("SELECT DISTINCT asset_id FROM ports")}
+    own_macs = {m for a in rows for m in mac_list(a["macs"])}
+
+    # Best port for every asset and every unknown MAC
+    best, unknown_best = {}, {}
+    for p in ports:
+        dev = p["asset_id"]
+        nb_id = neighbor_asset(p["neighbor"], by_mac, by_name)
+        nb_mac = scanner.norm_mac((p["neighbor"] or {}).get("chassis"))
+        wifi = p["kind"] == "wifi"
+        n = len(p["learned"])
+        if nb_id and nb_id != dev:
+            score = (0, 0, n)
+            if nb_id not in best or score < best[nb_id][0]:
+                best[nb_id] = (score, dev, p)
+        elif p["neighbor"] and (p["neighbor"].get("name") or nb_mac) and nb_mac not in own_macs:
+            key = nb_mac or f"lldp:{p['neighbor'].get('name')}"
+            unknown_best[key] = ((0, 0, n), dev, p, p["neighbor"].get("name") or "")
+        for mac in p["learned"]:
+            aid = by_mac.get(mac)
+            score = (1, 0 if wifi else 1, n)
+            if aid:
+                if aid != dev and (aid not in best or score < best[aid][0]):
+                    best[aid] = (score, dev, p)
+            elif mac != nb_mac and (mac not in unknown_best or score < unknown_best[mac][0]):
+                unknown_best[mac] = (score, dev, p, unknown_best.get(mac, (0, 0, 0, ""))[3])
+
+    # Ports taken over by a device placed there by hand
+    claims = {}
+    for a in rows:
+        if a["uplink_id"] and a["uplink_port"]:
+            claims.setdefault((a["uplink_id"], a["uplink_port"].strip().lower()), a["id"])
+
+    def node(a):
+        return {"id": a["id"], "type": "asset", "name": a["name"], "asset_type": a["asset_type"] or "",
+                "status": a["status"] or "", "location": a["location"] or "", "address": a["address"] or "",
+                "hostname": a["hostname"] or "", "maker_model": " ".join(x for x in (a["manufacturer"], a["model"]) if x),
+                "os": a["os"] or "", "managed": a["id"] in managed}
+
+    edges = []  # (child, parent, link)
+    for a in rows:
+        if a["uplink_id"] in assets:
+            parent = assets[a["uplink_id"]]
+            edges.append((a["id"], parent["id"], {"port": a["uplink_port"] or "", "source": "manual",
+                                                   "wireless": parent["id"] in is_ap}))
+        elif a["id"] in best:
+            _, dev, p = best[a["id"]]
+            link = {"port": p["name"], "speed": p["speed"], "source": "lldp" if best[a["id"]][0][0] == 0 else "mac",
+                    "wireless": p["kind"] == "wifi", "vlan": p["vlan"] or ""}
+            owner = claims.get((dev, p["name"].lower()))
+            if owner and owner != a["id"]:
+                edges.append((a["id"], owner, dict(link, port="", source="inferred",
+                                                   seen=f"{assets[dev]['name']} {p['name']}")))
+            else:
+                edges.append((a["id"], dev, link))
+
+    # On a port with just one known machine, unknown MACs are most likely its VMs and containers
+    alone = {}
+    for child, parent, link in edges:
+        if link["source"] in ("mac", "lldp") and child not in managed:
+            alone.setdefault((parent, link["port"].lower()), []).append(child)
+    groups = {}
+    for mac, (score, dev, p, name) in unknown_best.items():
+        owner = claims.get((dev, p["name"].lower()))
+        hosts = alone.get((dev, p["name"].lower()), [])
+        host = hosts[0] if not owner and len(hosts) == 1 and p["kind"] != "wifi" else None
+        parent = owner or host or dev
+        g = groups.setdefault((parent, dev, p["name"]), {
+            "id": f"u:{parent}:{dev}:{p['name']}", "type": "unknown", "devices": [], "on_host": bool(host),
+            "seen": f"{assets[dev]['name']} {p['name']}", "parent_link": {
+                "port": "" if owner or host else p["name"], "speed": p["speed"],
+                "source": "inferred" if owner or host else "mac", "wireless": p["kind"] == "wifi"}})
+        g["devices"].append({"mac": "" if mac.startswith("lldp:") else mac, "ip": arp.get(mac, ""), "name": name})
+
+    # Undirected graph, then a tree from the firewall (or the busiest switch) outwards
+    adj = {}
+    for child, parent, link in edges:
+        adj.setdefault(child, []).append((parent, link))
+        adj.setdefault(parent, []).append((child, link))
+    for (parent, _, _), g in groups.items():
+        adj.setdefault(parent, [])
+
+    def rank(aid):
+        t = (assets[aid]["asset_type"] or "").lower()
+        return (0 if t in ("firewall", "router") else 1 if aid in managed else 2, -len(adj.get(aid, [])))
+
+    nodes, placed = [], set()
+    for root in sorted(adj, key=rank):
+        if root in placed:
+            continue
+        queue = [(root, None, None)]
+        placed.add(root)
+        while queue:
+            aid, parent, link = queue.pop(0)
+            n = node(assets[aid])
+            n["parent"], n["link"] = parent, link
+            nodes.append(n)
+            for nxt, l in sorted(adj.get(aid, []), key=lambda x: (rank(x[0])[0], assets[x[0]]["name"].lower())):
+                if nxt not in placed:
+                    placed.add(nxt)
+                    queue.append((nxt, aid, l))
+    for (parent, _, _), g in sorted(groups.items(), key=lambda kv: kv[1]["seen"]):
+        g["parent"], g["link"] = parent, g.pop("parent_link")
+        g["devices"].sort(key=lambda d: (not d["ip"], d["name"] == "", d["mac"]))
+        nodes.append(g)
+    roots = [n["id"] for n in nodes if n["type"] == "asset" and n["parent"] is None]
+    internet = next((r for r in roots if (assets[r]["asset_type"] or "").lower() in ("firewall", "router")), None)
+    if internet:
+        nodes.insert(0, {"id": "internet", "type": "internet", "name": "Internet", "parent": None, "link": None})
+        next(n for n in nodes if n["id"] == internet).update(parent="internet", link={"port": "WAN", "source": "auto"})
+    unplaced = [node(a) for a in rows if a["id"] not in placed
+                and (a["status"] or "").lower() not in OFF_MAP_STATUSES]
+    for u in unplaced:
+        t = (assets[u["id"]]["asset_type"] or "").lower()
+        u["reason"] = ("set where it plugs in" if t in ("switch", "access point", "router", "firewall") and not u["managed"]
+                       else "no MAC addresses recorded" if not mac_list(assets[u["id"]]["macs"]) else "not seen on any scanned switch")
+    return {"nodes": nodes, "unplaced": sorted(unplaced, key=lambda u: u["name"].lower())}
+
+
 def replace_ports(conn, asset_id, ports):
     conn.execute("DELETE FROM ports WHERE asset_id = ?", (asset_id,))
     for p in ports:
@@ -346,12 +489,39 @@ def create_item(conn, data):
     return cur.lastrowid
 
 
+def check_uplink(conn, asset_id, uplink_id):
+    """What an asset is plugged into, set by hand. Must exist and must not loop back to the asset."""
+    if uplink_id in (None, "", 0, "0"):
+        return None
+    try:
+        uplink_id = int(uplink_id)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Connected to must be an asset")
+    seen = set()
+    cur = uplink_id
+    while cur and cur not in seen:
+        if cur == asset_id:
+            raise HTTPException(400, "That would connect the device to itself (directly or through another device)")
+        seen.add(cur)
+        row = conn.execute("SELECT id, kind, uplink_id FROM assets WHERE id = ?", (cur,)).fetchone()
+        if not row:
+            raise HTTPException(400, "Connected to: that asset doesn't exist")
+        if cur == uplink_id and row["kind"] == "keyboard":
+            raise HTTPException(400, "Devices can't be connected to a keyboard")
+        cur = row["uplink_id"]
+    return uplink_id
+
+
 def save_asset(conn, data, asset_id=None):
     fields = {k: clean(data[k]) or "" for k in ASSET_FIELDS if k in data and k != "macs"}
     if "macs" in data:
         fields["macs"] = ", ".join(mac_list(data["macs"]))
     if fields.get("kind") not in (None, "", "keyboard"):
         raise HTTPException(400, "Unknown asset kind")
+    if "uplink_id" in data:
+        fields["uplink_id"] = check_uplink(conn, asset_id, data["uplink_id"])
+        if not fields["uplink_id"]:
+            fields["uplink_port"] = ""
     if isinstance(data.get("specs"), dict):
         fields["specs"] = json.dumps({k: clean(v) for k, v in data["specs"].items() if v not in (None, "", [])})
     if asset_id is None:
@@ -470,6 +640,9 @@ def get_asset(asset_id: int):
         asset.pop("arp", None)
         asset["kind"] = asset["kind"] or ""
         asset["specs"] = json.loads(asset["specs"] or "{}")
+        up = conn.execute("SELECT id, name, asset_type FROM assets WHERE id = ?", (asset["uplink_id"],)).fetchone() \
+            if asset["uplink_id"] else None
+        asset["uplink"] = dict(up) if up else None
         profile = json.loads(asset.pop("snmp", None) or "null")
         asset["snmp"] = {k: profile.get(k) or "" for k in SNMP_KEYS} if profile else None
         asset["snmp_saved"] = bool(profile and profile.get("remember"))
@@ -501,9 +674,16 @@ def delete_asset(asset_id: int, return_to_spare: bool = True):
         asset = fetch_asset(conn, asset_id)
         for row in conn.execute("SELECT id FROM installs WHERE asset_id = ?", (asset_id,)).fetchall():
             remove_install(conn, row["id"], return_to_spare)
+        conn.execute("UPDATE assets SET uplink_id = NULL, uplink_port = '' WHERE uplink_id = ?", (asset_id,))
         conn.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
         log(conn, f"Deleted asset {asset['name']}")
         return {"ok": True}
+
+
+@app.get("/api/map")
+def network_map():
+    with db() as conn:
+        return build_map(conn)
 
 
 @app.post("/api/assets/{asset_id}/components")

@@ -148,6 +148,8 @@ const ICONS = {
   shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
   link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
   refresh: '<path d="M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5"/>',
+  minus: '<path d="M5 12h14"/>',
+  topology: '<rect x="9" y="2" width="6" height="5" rx="1"/><rect x="2" y="17" width="6" height="5" rx="1"/><rect x="16" y="17" width="6" height="5" rx="1"/><path d="M12 7v5M5 17v-5h14v5"/>',
   keyboard: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/>',
   kbswitch: '<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M12 8v8M8 12h8"/>',
   keycap: '<path d="M3 19h18L18.6 6.4a1.5 1.5 0 0 0-1.5-1.2H6.9a1.5 1.5 0 0 0-1.5 1.2z"/><path d="M8.5 10h7"/>',
@@ -406,6 +408,7 @@ function renderNav() {
     item('#/assets', 'assets', 'monitor', 'Assets', COUNTS.assets),
     item('#/inventory', 'inventory', 'boxes', 'Inventory', COUNTS.items),
     cats.length ? h('div', { class: 'nav-sub' }, cats.map(catLink)) : null,
+    item('#/map', 'map', 'topology', 'Network map'),
     h('div', { class: 'nav-label' }, 'Keyboards'),
     item('#/keyboards', 'keyboards', 'keyboard', 'Keyboards', COUNTS.keyboards),
     META.categories.filter(c => c.group === 'keyboard').map(catLink),
@@ -562,15 +565,20 @@ function confirmModal(title, message, confirmLabel, extra) {
 
 const ASSET_SECTIONS = [
   ['Basics', [['name', 'Name'], ['asset_type', 'Type'], ['status', 'Status'], ['location', 'Location']]],
-  ['Network', [['hostname', 'Hostname'], ['address', 'IP / address for scans'], ['os', 'Operating system / firmware'], ['macs', 'MAC addresses']]],
+  ['Network', [['hostname', 'Hostname'], ['address', 'IP / address for scans'], ['os', 'Operating system / firmware'], ['macs', 'MAC addresses'],
+    ['uplink_id', 'Connected to'], ['uplink_port', 'Port on that device']]],
   ['Hardware', [['manufacturer', 'Manufacturer'], ['model', 'Model'], ['model_number', 'Model number / SKU'], ['serial', 'Serial number']]],
 ];
 const ASSET_FORM = ASSET_SECTIONS.flatMap(([, fields]) => fields);
 
-function assetFormFields(data) {
+function assetFormFields(data, others = []) {
   const input = key => {
     let el;
-    if (key === 'asset_type') el = selectEl([['', '—'], ...META.asset_types], data[key] || '', {});
+    if (key === 'uplink_id') {
+      el = selectEl([['', 'Work it out from switch scans'], ...others.filter(o => o.id !== data.id && !isKeyboard(o))
+        .sort((x, y) => isNetwork(y) - isNetwork(x)).map(o => [String(o.id), o.name])], data.uplink_id ? String(data.uplink_id) : '', {});
+    } else if (key === 'uplink_port') el = h('input', { value: data[key] || '', placeholder: 'e.g. gi18, port 3' });
+    else if (key === 'asset_type') el = selectEl([['', '—'], ...META.asset_types], data[key] || '', {});
     else if (key === 'status') el = selectEl([['', '—'], ...META.statuses], data[key] || '', {});
     else if (key === 'location') el = h('input', { list: 'dl-locations', value: data[key] || '' });
     else if (key === 'macs') el = h('input', { value: Array.isArray(data.macs) ? data.macs.join(', ') : data.macs || '', placeholder: 'Filled in by scans; used to find its switch port' });
@@ -590,13 +598,15 @@ function assetBody(data) {
   return Object.fromEntries([...ASSET_FORM.map(([k]) => k), 'notes'].map(k => [k, data[k] || '']));
 }
 
-function editAssetModal(asset, onSaved) {
+async function editAssetModal(asset, onSaved) {
   const data = { ...asset };
-  openModal(asset.id ? `Edit ${asset.name}` : 'New asset', assetFormFields(data), [
+  const others = await api('GET', '/api/assets');
+  openModal(asset.id ? `Edit ${asset.name}` : 'New asset', assetFormFields(data, others), [
     { label: 'Cancel' },
     {
       label: 'Save changes', class: 'primary', action: async () => {
         const body = assetBody(data);
+        body.uplink_id = data.uplink_id ? Number(data.uplink_id) : null;
         const res = asset.id ? await api('PUT', `/api/assets/${asset.id}`, body) : await api('POST', '/api/assets', body);
         toast('Saved');
         onSaved(res.id);
@@ -965,15 +975,22 @@ async function assetView(id) {
 
 /** Where a machine plugs in, worked out from switch MAC tables and LLDP. */
 function networkCard(a) {
-  if (!a.links.length) return null;
+  if (!a.links.length && !a.uplink) return null;
+  const reload = () => route();
   return h('section', { class: 'card' },
-    h('div', { class: 'card-head' }, h('h2', null, 'Network')),
+    h('div', { class: 'card-head' }, h('h2', null, 'Network'),
+      h('div', { class: 'actions' }, h('a', { class: 'link small', href: '#/map' }, 'Map'),
+        h('button', { class: 'link small', onclick: () => connectionModal(a, reload) }, 'Change'))),
+    a.uplink ? h('div', { class: 'links' }, h('a', { class: 'link-row', href: `#/assets/${a.uplink.id}` }, typeIcon(a.uplink.asset_type, 'sm'),
+      h('div', null, h('div', { class: 't' }, a.uplink.name, a.uplink_port ? [h('span', { class: 'muted' }, ' · '), h('span', { class: 'mono' }, a.uplink_port)] : null),
+        h('div', { class: 's' }, (a.uplink.asset_type || '').toLowerCase() === 'access point' ? 'Wi-Fi · set by hand' : 'Plugged in here · set by hand')))) : null,
+    a.uplink && a.links.length ? h('div', { class: 'faint small', style: 'padding:8px 16px 0' }, 'Switch scans see it on:') : null,
     h('div', { class: 'links' }, a.links.map(l => h('a', { class: 'link-row', href: `#/assets/${l.device.id}` },
       typeIcon(l.device.asset_type, 'sm'),
       h('div', null,
         h('div', { class: 't' }, l.device.name, h('span', { class: 'muted' }, ' · '), h('span', { class: 'mono' }, l.port), l.alias ? h('span', { class: 'muted' }, ` “${l.alias}”`) : null),
         h('div', { class: 's' }, [l.oper === 'up' && l.speed ? fmtSpeed(l.speed) : l.oper, l.vlan ? `VLAN ${l.vlan}` : '',
-          l.via ? `through ${l.via.name}` : '', l.lldp ? 'LLDP' : ''].filter(Boolean).join(' · ')))))));
+          l.via && !a.uplink ? `through ${l.via.name}` : '', l.lldp ? 'LLDP' : ''].filter(Boolean).join(' · ')))))));
 }
 
 function portLabel(p) {
@@ -1798,6 +1815,262 @@ async function itemView(id) {
   ];
 }
 
+// ------------------------------------------------------------------ network map
+
+/** Hints for MACs the map can't match to an asset: VMs, containers and phones' private addresses. */
+const MAC_HINTS = [['bc:24:11', 'Proxmox VM/LXC'], ['00:15:5d', 'Hyper-V VM'], ['02:42:', 'Docker'], ['52:54:00', 'KVM VM'],
+  ['00:0c:29', 'VMware VM'], ['00:50:56', 'VMware VM'], ['08:00:27', 'VirtualBox VM']];
+function macHint(mac) {
+  if (!mac) return '';
+  const hit = MAC_HINTS.find(([p]) => mac.startsWith(p));
+  if (hit) return hit[1];
+  return /^.[26ae]/.test(mac) ? 'Private (randomized) MAC' : '';
+}
+function hintSummary(devices) {
+  const counts = {};
+  for (const d of devices) { const k = macHint(d.mac); if (k) counts[k] = (counts[k] || 0) + 1; }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k.replace(/^Private \(randomized\) MAC$/, 'private MAC')}`).join(' · ');
+}
+// Behind an unmanaged switch, the speed is the managed switch's port, not this link's
+const linkText = l => [l && l.port, l && l.speed && l.source !== 'inferred' ? fmtSpeed(l.speed) : ''].filter(Boolean).join(' · ');
+const MAP = { view: null, showUnknown: true };
+
+/** Which device this is plugged into, set by hand. Used from the map and the asset page. */
+async function connectionModal(node, onDone) {
+  const assets = (await api('GET', '/api/assets')).filter(a => !isKeyboard(a) && a.id !== node.id);
+  const current = await api('GET', `/api/assets/${node.id}`);
+  const state = { uplink_id: current.uplink_id ? String(current.uplink_id) : '', uplink_port: current.uplink_port || '' };
+  const net = assets.filter(isNetwork), rest = assets.filter(a => !isNetwork(a));
+  const sel = h('select', { onchange: e => { state.uplink_id = e.target.value; } },
+    h('option', { value: '' }, 'Work it out from switch scans'),
+    h('optgroup', { label: 'Network devices' }, net.map(a => h('option', { value: String(a.id) }, a.name))),
+    h('optgroup', { label: 'Other devices (e.g. a Proxmox host for a VM, or a dock)' }, rest.map(a => h('option', { value: String(a.id) }, a.name))));
+  sel.value = state.uplink_id;
+  openModal(`Where ${node.name} plugs in`, h('div', null,
+    section(null, h('div', { class: 'grid' },
+      field('Connected to', sel),
+      field('Port (optional)', h('input', { value: state.uplink_port, placeholder: 'e.g. gi18, port 3', oninput: e => { state.uplink_port = e.target.value; } })),
+      h('p', { class: 'muted small wide', style: 'margin:0' },
+        'Use this for anything scans can’t see, like unmanaged switches. If you give a managed switch’s port, ',
+        'everything else the switch sees on that port is placed behind this device. Connecting to an access point draws a wireless link.')))), [
+    { label: 'Cancel' },
+    { label: 'Save', class: 'primary', action: async () => {
+      await api('PUT', `/api/assets/${node.id}`, { uplink_id: state.uplink_id ? Number(state.uplink_id) : null, uplink_port: state.uplink_port });
+      toast('Saved');
+      onDone();
+    } },
+  ]);
+}
+
+async function mapView() {
+  setCrumbs(['Network map']);
+  const data = await api('GET', '/api/map');
+  const reload = () => route();
+  const W = 210, COLW = 300, GAP = 12, H_ASSET = 54, H_UNK = 44, PAD = 24;
+
+  const byId = new Map(data.nodes.map(n => [n.id, n]));
+  const kids = new Map();
+  for (const n of data.nodes) if (n.parent != null) {
+    if (!kids.has(n.parent)) kids.set(n.parent, []);
+    kids.get(n.parent).push(n);
+  }
+  const order = n => n.type === 'unknown' ? 3 : n.managed || isNetwork(n) ? 0 : 1;
+  for (const list of kids.values()) list.sort((a, b) => order(a) - order(b) || String(a.name || a.seen).localeCompare(String(b.name || b.seen), undefined, { numeric: true }));
+
+  const canvas = h('div', { class: 'map-canvas' });
+  const inner = h('div', { class: 'map-inner' });
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('class', 'map-edges');
+  inner.append(svg);
+  canvas.append(inner);
+  const panel = h('div', { class: 'map-panel', hidden: true });
+  const pos = new Map();
+  let selected = null;
+
+  const visible = n => MAP.showUnknown || n.type !== 'unknown';
+  const draw = () => {
+    pos.clear();
+    let cursor = PAD;
+    const place = (n, depth) => {
+      const ch = (kids.get(n.id) || []).filter(visible);
+      const hgt = n.type === 'unknown' ? H_UNK : H_ASSET;
+      if (!ch.length) { pos.set(n.id, { x: PAD + depth * COLW, y: cursor, h: hgt }); cursor += hgt + GAP; return; }
+      ch.forEach(c => place(c, depth + 1));
+      const first = pos.get(ch[0].id), last = pos.get(ch[ch.length - 1].id);
+      const mid = (first.y + first.h / 2 + last.y + last.h / 2) / 2;
+      pos.set(n.id, { x: PAD + depth * COLW, y: Math.max(mid - hgt / 2, 0), h: hgt });
+    };
+    data.nodes.filter(n => n.parent == null && visible(n)).forEach(r => { place(r, 0); cursor += GAP * 2; });
+
+    let maxX = 0, maxY = 0;
+    for (const p of pos.values()) { maxX = Math.max(maxX, p.x + W); maxY = Math.max(maxY, p.y + p.h); }
+    const width = maxX + PAD, height = maxY + PAD;
+    inner.style.width = width + 'px';
+    inner.style.height = height + 'px';
+    svg.setAttribute('width', width);
+    svg.setAttribute('height', height);
+
+    const path = new Set();
+    for (let n = selected && byId.get(selected); n; n = byId.get(n.parent)) path.add(n.id);
+    svg.replaceChildren();
+    inner.querySelectorAll('.map-node').forEach(el => el.remove());
+    for (const n of data.nodes) {
+      const p = pos.get(n.id);
+      if (!p) continue;
+      const parent = n.parent != null && pos.get(n.parent);
+      if (parent) {
+        const sx = parent.x + W, sy = parent.y + parent.h / 2, ex = p.x, ey = p.y + p.h / 2, tx = sx + 22;
+        const e = document.createElementNS(svgNS, 'path');
+        e.setAttribute('d', `M${sx},${sy} H${tx} V${ey} H${ex}`);
+        const l = n.link || {};
+        e.setAttribute('class', ['edge', l.wireless ? 'wireless' : '', l.source === 'inferred' ? 'inferred' : '',
+          path.has(n.id) ? 'hot' : ''].filter(Boolean).join(' '));
+        svg.append(e);
+        const label = linkText(l) || (l.wireless ? 'Wi-Fi' : '');
+        if (label) {
+          const t = document.createElementNS(svgNS, 'text');
+          t.setAttribute('x', ex - 8);
+          t.setAttribute('y', ey - 6);
+          t.setAttribute('text-anchor', 'end');
+          t.setAttribute('class', 'edge-label' + (path.has(n.id) ? ' hot' : ''));
+          t.textContent = label;
+          svg.append(t);
+        }
+      }
+      const el = n.type === 'unknown'
+        ? h('button', { class: 'map-node unknown' + (selected === n.id ? ' sel' : ''), type: 'button' },
+          h('span', { class: 'ico sm c-gray' }, icon('search')),
+          h('span', { class: 'txt' }, h('span', { class: 't' }, `${n.devices.length} unknown device${n.devices.length > 1 ? 's' : ''}`),
+            h('span', { class: 's' }, hintSummary(n.devices) || `seen on ${n.seen}`)))
+        : n.type === 'internet'
+          ? h('button', { class: 'map-node internet' + (selected === n.id ? ' sel' : ''), type: 'button' },
+            h('span', { class: 'ico sm c-blue' }, icon('globe')), h('span', { class: 'txt' }, h('span', { class: 't' }, 'Internet')))
+          : h('button', { class: 'map-node' + (selected === n.id ? ' sel' : '') + (path.has(n.id) ? ' on-path' : ''), type: 'button', ondblclick: () => { location.hash = `#/assets/${n.id}`; } },
+            typeIcon(n.asset_type, 'sm'),
+            h('span', { class: 'txt' }, h('span', { class: 't' }, n.name),
+              h('span', { class: 's' }, [n.address && !/^\d+$/.test(n.address) ? n.address : '', n.location].filter(Boolean).join(' · ') || n.asset_type || '')));
+      el.style.cssText = `left:${p.x}px;top:${p.y}px;width:${W}px;height:${p.h}px`;
+      el.addEventListener('click', e => { e.stopPropagation(); if (!dragged) select(n.id); });
+      inner.append(el);
+    }
+  };
+
+  // ---- side panel
+  const select = id => {
+    selected = id;
+    draw();
+    const n = byId.get(id);
+    if (!n) { panel.hidden = true; return; }
+    panel.hidden = false;
+    const close = iconButton('x', 'Close', () => { selected = null; panel.hidden = true; draw(); });
+    const parent = byId.get(n.parent);
+    const l = n.link || {};
+    const how = { lldp: 'the switch’s LLDP neighbour table', mac: 'the switch’s MAC table', manual: 'set by hand', inferred: '' }[l.source] || '';
+    if (n.type === 'internet') { setKids(panel, h('div', { class: 'panel-head' }, h('h3', null, 'Internet'), close), h('p', { class: 'muted small' }, 'Through the firewall’s WAN port.')); return; }
+    if (n.type === 'unknown') {
+      setKids(panel,
+        h('div', { class: 'panel-head' }, h('h3', null, `${n.devices.length} unknown device${n.devices.length > 1 ? 's' : ''}`), close),
+        h('p', { class: 'muted small' }, `Seen on ${n.seen}`, n.on_host ? `, the same port as ${parent.name}, so these are most likely its VMs or containers.` : '.',
+          ' Add one as a device to give it a name and place it.'),
+        !n.on_host && n.devices.some(d => macHint(d.mac) === 'Proxmox VM/LXC')
+          ? h('div', { class: 'alert hint small', style: 'margin:0 0 10px' }, 'This looks like a Proxmox host and its guests. If the host is already in Rigbook, scan it so its MAC address is recorded, and the guests will group under it.') : null,
+        h('div', { class: 'panel-list' }, n.devices.map(d => h('div', { class: 'panel-row' },
+          h('div', null, h('div', { class: 'mono small' }, d.mac || d.name), h('div', { class: 'faint small' },
+            [d.name && d.mac ? d.name : '', d.ip, macHint(d.mac)].filter(Boolean).join(' · ') || 'no IP in the ARP table')),
+          h('button', { class: 'small', onclick: () => editAssetModal({ name: d.name || '', address: d.ip, macs: d.mac, status: 'In use',
+            uplink_id: n.on_host ? '' : parent && parent.type === 'asset' ? parent.id : '', uplink_port: '' }, reload) }, icon('plus'), 'Add')))));
+      return;
+    }
+    setKids(panel,
+      h('div', { class: 'panel-head' }, h('div', { class: 'ent' }, typeIcon(n.asset_type, 'sm'), h('h3', null, n.name)), close),
+      h('div', { class: 'small', style: 'display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px' }, statusPill(n.status), n.asset_type ? h('span', { class: 'pill plain' }, n.asset_type) : null),
+      propsList([['Address', n.address], ['Hostname', n.hostname], ['Model', n.maker_model], ['Location', n.location],
+        [isNetwork(n) ? 'Firmware' : 'OS', n.os]]),
+      h('div', { class: 'panel-link' },
+        h('div', { class: 'k' }, 'Plugged into'),
+        parent ? h('div', null, h('strong', null, parent.name || 'Internet'), linkText(l) ? ` · ${linkText(l)}` : '', l.wireless ? ' · Wi-Fi' : '',
+          h('div', { class: 'faint small' }, l.source === 'inferred' ? `Seen on ${l.seen}, placed behind ${parent.name} because it plugs into that port` : how ? `From ${how}` : ''))
+          : h('div', { class: 'faint' }, 'Nothing (top of the map)')),
+      h('div', { class: 'actions', style: 'margin-top:12px' },
+        h('a', { class: 'btn small', href: `#/assets/${n.id}` }, 'Open'),
+        h('button', { class: 'small', onclick: () => connectionModal(n, reload) }, icon('link'), 'Change connection')));
+  };
+
+  // ---- pan + zoom
+  const view = MAP.view || { x: 0, y: 0, k: 1 };
+  const apply = () => { inner.style.transform = `translate(${view.x}px,${view.y}px) scale(${view.k})`; MAP.view = { ...view, cw: canvas.clientWidth }; };
+  const fit = () => {
+    const cw = canvas.clientWidth, ch = canvas.clientHeight;
+    const iw = inner.offsetWidth, ih = inner.offsetHeight;
+    // A phone can't show the whole width readably: fit the height and let it pan sideways from the left
+    const narrow = cw < 720;
+    view.k = (narrow ? Math.max(0.55, Math.min(0.85, ch / ih)) : Math.min(1, cw / iw, ch / ih)) || 1;
+    view.x = narrow ? 0 : (cw - iw * view.k) / 2;
+    view.y = Math.max(0, (ch - ih * view.k) / 2);
+    apply();
+  };
+  const zoom = (f, cx, cy) => {
+    const k = Math.min(2.5, Math.max(0.2, view.k * f));
+    cx = cx ?? canvas.clientWidth / 2; cy = cy ?? canvas.clientHeight / 2;
+    view.x = cx - (cx - view.x) * (k / view.k);
+    view.y = cy - (cy - view.y) * (k / view.k);
+    view.k = k;
+    apply();
+  };
+  let drag = null, dragged = false;
+  canvas.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
+    dragged = false;
+  });
+  window.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (!dragged && Math.hypot(dx, dy) < 4) return;
+    if (!dragged) { dragged = true; canvas.setPointerCapture(e.pointerId); canvas.classList.add('dragging'); }
+    view.x = drag.vx + dx; view.y = drag.vy + dy;
+    apply();
+  });
+  window.addEventListener('pointerup', () => { drag = null; canvas.classList.remove('dragging'); setTimeout(() => { dragged = false; }, 0); });
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = canvas.getBoundingClientRect();
+    zoom(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  canvas.addEventListener('click', () => { if (!dragged && selected) { selected = null; panel.hidden = true; draw(); } });
+
+  draw();
+  // Keep the zoom and position between visits, unless the window is a different size now
+  requestAnimationFrame(() => { if (MAP.view && MAP.view.cw === canvas.clientWidth) { Object.assign(view, MAP.view); apply(); } else fit(); });
+
+  const nUnknown = data.nodes.filter(n => n.type === 'unknown').reduce((s, n) => s + n.devices.length, 0);
+  const nAssets = data.nodes.filter(n => n.type === 'asset').length;
+  const unknownToggle = h('label', { class: 'check small' }, h('input', { type: 'checkbox', checked: MAP.showUnknown, onchange: e => {
+    MAP.showUnknown = e.target.checked; draw(); fit();
+  } }), `Unknown devices (${nUnknown})`);
+  const addSwitch = () => editAssetModal({ asset_type: 'Switch', status: 'In use', name: '' }, reload);
+
+  return [
+    h('div', { class: 'page-head' },
+      h('div', null, h('h1', null, 'Network map'), h('div', { class: 'sub' }, `${nAssets} devices, from switch scans and connections set by hand`)),
+      h('div', { class: 'actions' }, h('button', { onclick: addSwitch }, icon('plus'), 'Add unmanaged switch'))),
+    h('section', { class: 'card map-card' },
+      h('div', { class: 'filters' },
+        unknownToggle,
+        h('span', { class: 'grow' }),
+        h('span', { class: 'map-legend small muted' }, h('i', { class: 'lg-wired' }), 'Wired', h('i', { class: 'lg-wifi' }), 'Wi-Fi', h('i', { class: 'lg-inferred' }), 'Inferred (behind an unmanaged switch, or a VM on its host)'),
+        h('div', { class: 'btn-group' },
+          iconButton('minus', 'Zoom out', () => zoom(1 / 1.25)), iconButton('plus', 'Zoom in', () => zoom(1.25)),
+          h('button', { class: 'small', onclick: fit }, 'Fit'))),
+      h('div', { class: 'map-wrap' }, canvas, panel),
+      data.unplaced.length ? h('div', { class: 'map-unplaced' },
+        h('span', { class: 'muted small' }, 'Not on the map:'),
+        data.unplaced.map(u => h('button', { class: 'chip-btn', title: u.reason, onclick: () => connectionModal(u, reload) },
+          typeIcon(u.asset_type, 'sm'), u.name, h('span', { class: 'faint' }, ` · ${u.reason}`)))) : null),
+  ];
+}
+
 // ------------------------------------------------------------------ keyboards
 
 const KB_FILTERS = { q: '', status: '', layout: '' };
@@ -2076,6 +2349,7 @@ const ROUTES = [
   [/^#\/assets\/new(?:\?method=(\w+))?$/, 'new', m => newAssetView(m[1])],
   [/^#\/assets\/(\d+)$/, 'assets', m => assetView(m[1])],
   [/^#\/keyboards\/(\d+)$/, 'keyboards', m => keyboardView(m[1])],
+  [/^#\/map$/, 'map', () => mapView()],
   [/^#\/keyboards$/, 'keyboards', () => keyboardsView()],
   [/^#\/inventory\/(\d+)$/, 'inventory', m => itemView(m[1])],
   [/^#\/inventory(?:\?cat=(\w+))?$/, 'inventory', m => inventoryView(m[1])],
